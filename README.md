@@ -14,7 +14,7 @@ For a longer walkthrough and an OCaml Incremental parity checklist, see
 [TUTORIAL.md](TUTORIAL.md).
 
 Lean API documentation is published from CI to
-[GitHub Pages](https://chitoge.github.io/leancremental/).
+[GitHub Pages](https://chitoge.github.io/Leancremental/).
 
 ## Status
 
