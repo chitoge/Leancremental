@@ -1,0 +1,11 @@
+.lake/
+build/
+*.olean
+*.ilean
+*.c
+*.o
+*.so
+*.a
+tests
+docbuild/lake-manifest.json
+docbuild/lean-toolchain
