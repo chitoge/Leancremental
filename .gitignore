@@ -9,3 +9,4 @@ build/
 tests
 docbuild/lake-manifest.json
 docbuild/lean-toolchain
+.elan/

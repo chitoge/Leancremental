@@ -94,7 +94,52 @@ def nodeInfos (state : State) : IO (Array NodeInfo) := do
 def invariantViolations (state : State) : IO (Array String) := do
   let infos <- nodeInfos state
   let mut messages := CoreInvariant.infoViolations false infos
-  let entries <- state.recomputeHeap.entries.get
+  let generations <- state.nodeGenerations.get
+  if generations.size != infos.size then
+    messages := messages.push s!"node generation table size mismatch: expected {infos.size}, got {generations.size}"
+  let recycledNodeIds <- state.recycledNodeIdsRef.get
+  let mut seenRecycled := #[]
+  for id in recycledNodeIds do
+    if !CoreInvariant.validId infos id then
+      messages := messages.push s!"recycled-node list contains unknown node {id}"
+    if CoreInvariant.containsId seenRecycled id then
+      messages := messages.push s!"recycled-node list contains duplicate node {id}"
+    else
+      seenRecycled := seenRecycled.push id
+    match infos[id]? with
+    | none =>
+        pure ()
+    | some info =>
+        if info.necessary then
+          messages := messages.push s!"recycled-node list contains necessary node {id}"
+        if !info.parents.isEmpty then
+          messages := messages.push s!"recycled-node list contains node {id} with parents {info.parents}"
+  let expectedStaleNecessary := infos.foldl (fun acc info =>
+    if info.necessary && info.stale then
+      acc.push info.id
+    else
+      acc) #[]
+  let staleNecessaryIds <- State.staleNecessaryIds state
+  if staleNecessaryIds != expectedStaleNecessary then
+    messages := messages.push s!"staleNecessaryIds index mismatch: expected {expectedStaleNecessary}, got {staleNecessaryIds}"
+  let pendingDirty <- state.pendingDirtyRef.get
+  for (id, _) in pendingDirty.toList do
+    if !CoreInvariant.validId infos id then
+      messages := messages.push s!"pendingDirty contains unknown node {id}"
+  let mut expectedTagIndex : Std.HashMap String (Array Nat) := Std.HashMap.emptyWithCapacity
+  for info in infos do
+    for tag in info.tags do
+      expectedTagIndex := expectedTagIndex.insert tag ((expectedTagIndex.getD tag #[]).push info.id)
+  let actualTagIndex <- state.tagIndexRef.get
+  for (tag, expectedIds) in expectedTagIndex.toList do
+    let actualIds := actualTagIndex.getD tag #[]
+    if actualIds != expectedIds then
+      messages := messages.push s!"tag index mismatch for '{tag}': expected {expectedIds}, got {actualIds}"
+  for (tag, actualIds) in actualTagIndex.toList do
+    let expectedIds := expectedTagIndex.getD tag #[]
+    if actualIds != expectedIds then
+      messages := messages.push s!"tag index has stale entry for '{tag}': expected {expectedIds}, got {actualIds}"
+  let entries <- Internal.State.recomputeHeapEntries state
   let mut seenEntries := #[]
   for id in entries do
     if CoreInvariant.containsId seenEntries id then
@@ -105,8 +150,6 @@ def invariantViolations (state : State) : IO (Array String) := do
     | none =>
         messages := messages.push s!"recompute heap contains unknown node {id}"
     | some info =>
-        if !info.necessary then
-          messages := messages.push s!"recompute heap contains unnecessary node {id}"
         if !info.stale then
           messages := messages.push s!"recompute heap contains non-stale node {id}"
   let observers <- state.observers.get

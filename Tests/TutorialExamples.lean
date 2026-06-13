@@ -80,8 +80,7 @@ def observabilityExample : IO (Array Bool) := do
 def cutoffExample : IO Nat := do
   let state <- State.create
   let x <- Var.create state 1
-  let doubled <- map (Var.watch x) (fun n => n * 2)
-  Incr.setCutoff doubled Cutoff.ofEq
+  let doubled <- map (Var.watch x) (fun n => n * 2) Cutoff.ofEq
 
   let observer <- observe doubled
   State.stabilize state
@@ -108,6 +107,28 @@ def branchExample : IO Nat := do
   let switched <- Observer.value! observer
 
   if unchanged == 10 then pure switched else throw (IO.userError "bad branch")
+
+def bindTimelineExample : IO (Nat × Nat × Nat) := do
+  let state <- State.create
+  let useLeft <- Var.create state true
+  let left <- Var.create state 10
+  let right <- Var.create state 100
+
+  let selected <- ifThenElse (Var.watch useLeft) (Var.watch left) (Var.watch right)
+  let observer <- observe selected
+
+  State.stabilize state
+  let first <- Observer.value! observer
+
+  Var.set right 101
+  State.stabilize state
+  let stillLeft <- Observer.value! observer
+
+  Var.set useLeft false
+  State.stabilize state
+  let nowRight <- Observer.value! observer
+
+  pure (first, stillLeft, nowRight)
 
 def averagePrefix (state : State) (values : Array (Incr Nat)) (length : Incr Nat) : IO (Incr Nat) :=
   bind length (fun n => do
@@ -304,14 +325,77 @@ def resultExample : IO (Except String Nat) := do
 def documentVersionExample : IO (Except String Nat) := do
   let state <- State.create
   let doc <- Document.create state 10
-  let query <- map (Document.watchContent doc) (fun value => value + 1)
-  let tagged <- Document.tag doc query
-  let currentOnly <- Document.requireCurrent doc tagged
+  let snapshot <- Document.snapshot doc
+  let stale <- const state { version := snapshot.version, value := snapshot.content + 1 }
+  let currentOnly <- Document.requireCurrent doc stale
   let observer <- observe currentOnly
-  State.stabilize state
   let _nextVersion <- Document.edit doc (fun value => value + 10)
   State.stabilize state
   Observer.value! observer
+
+def documentRequestTokenExample : IO Bool := do
+  let state <- State.create
+  let doc <- Document.create state 10
+  let token <- Document.requestToken doc 7
+  let _nextVersion <- Document.edit doc (fun value => value + 10)
+  Document.requestIsCurrent doc token
+
+def buildImpactExample : IO (Array String × Array String) := do
+  let state <- State.create
+  let srcA <- Var.create state "module A v1"
+  let srcB <- Var.create state "module B v1"
+  let objA <- map (Var.watch srcA) (fun s => s ++ " [obj]")
+  let objB <- map (Var.watch srcB) (fun s => s ++ " [obj]")
+  let libA <- map objA (fun s => s ++ " [lib]")
+  let app  <- map2 objA objB (· ++ " + " ++ · ++ " [app]")
+  Incr.addTag libA "target"
+  Incr.addTag app  "target"
+  let libAObs <- observe libA
+  let appObs  <- observe app
+  let fired <- IO.mkRef (#[] : Array String)
+  Observer.onUpdate libAObs (fun _ => fired.modify (· |>.push "libA"))
+  Observer.onUpdate appObs  (fun _ => fired.modify (· |>.push "app"))
+  State.stabilize state
+  fired.set #[]
+  Var.set srcA "module A v2"
+  State.stabilize state
+  let afterA <- fired.get
+  fired.set #[]
+  Var.set srcB "module B v2"
+  State.stabilize state
+  let afterB <- fired.get
+  pure (afterA.toList.mergeSort.toArray, afterB.toList.mergeSort.toArray)
+
+private def parentClosure (state : State) (startId : Nat) : IO (Array Nat) := do
+  let visited <- IO.mkRef (#[] : Array Nat)
+  let queue   <- IO.mkRef #[startId]
+  while !(← queue.get).isEmpty do
+    let q  <- queue.get
+    let id := q[0]!
+    queue.set (q.extract 1 q.size)
+    let seen <- visited.get
+    if !seen.contains id then
+      visited.set (seen.push id)
+      let info <- State.nodeInfo state id
+      queue.modify (info.parents.foldl Array.push)
+  visited.get
+
+def blastRadiusExample : IO Nat := do
+  let state <- State.create
+  let srcA <- Var.create state "A"
+  let srcB <- Var.create state "B"
+  let objA <- map (Var.watch srcA) id
+  let objB <- map (Var.watch srcB) id
+  let libA <- map objA id
+  let app  <- map2 objA objB (· ++ ·)
+  Incr.addTag libA "target"
+  Incr.addTag app  "target"
+  let _obs1 <- observe libA
+  let _obs2 <- observe app
+  State.stabilize state
+  let reachable  <- parentClosure state srcA.watch.id
+  let allTargets <- State.nodesWithTag state "target"
+  pure (allTargets.filter (fun id => reachable.contains id)).size
 
 /-- Run all checked tutorial examples and validate their expected outputs. -/
 def runAll : IO Unit := do
@@ -321,6 +405,7 @@ def runAll : IO Unit := do
   assertEq "observability example" (← observabilityExample) #[true, false]
   assertEq "cutoff example" (← cutoffExample) 2
   assertEq "branch example" (← branchExample) 101
+  assertEq "bind timeline example" (← bindTimelineExample) (10, 10, 101)
   assertEq "average prefix example" (← averagePrefixExample) 8
   assertEq "fold example" (← foldExample) 6
   assertEq "dependOn example" (← dependOnExample) (10, true)
@@ -338,11 +423,15 @@ def runAll : IO Unit := do
   if memoResult.1 == 2 && memoResult.2.1 == 1 then pure () else throw (IO.userError "memo table example failed")
   assertEq "memo scope example" (← memoScopeExample) (2, 1)
   assertEq "stale value example" (← staleValueExample) (some 2, 11)
-  assertEq "stabilize stats example" (← stabilizeStatsExample) (1, 2, 1)
+  assertEq "stabilize stats example" (← stabilizeStatsExample) (1, 1, 1)
   assertEq "budgeted stabilization example" (← budgetedStabilizationExample) 4
   assertEq "indexed aggregate example" (← indexedAggregateExample) 12
   assertOk "result example" (← resultExample) 5
-  assertOk "document version example" (← documentVersionExample) 21
+  assertError "document version example" (← documentVersionExample)
+    "stale result for document version 0, current version is 1"
+  assertEq "document request token example" (← documentRequestTokenExample) false
+  assertEq "build impact example" (← buildImpactExample) (#["app", "libA"], #["app"])
+  assertEq "blast radius example" (← blastRadiusExample) 2
 
 end TutorialExamples
 end Tests

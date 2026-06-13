@@ -47,27 +47,41 @@ def dependencyIds (node : Node α) : IO (Array Nat) := do
   let dependencies <- node.dependencies.get
   pure (dependencies.map (fun dependency => dependency.nodeId))
 
-/-- Create an expert node with a custom recomputation action. -/
+/--
+Create an expert node with a custom recomputation action.
+
+`compute` runs under the `State.stateLock` write lock.  It must **not** call
+`Var.set`, `Var.replace`, or `State.stabilize` — doing so deadlocks.
+Reading `Var.value` is safe (no lock taken) but returns the value as of the
+last `set`, which may race with concurrent `Var.set` calls from other threads.
+
+`onUpdate` callbacks registered via `Observer.onUpdate` fire *outside* the
+write lock and may freely call `Observer.value!`, `Var.set`, or `stabilize`.
+-/
 def create (state : State) (compute : IO α) : IO (Node α) := do
   let valueRef <- IO.mkRef none
   let cutoffRef <- IO.mkRef Cutoff.never
+  let digestRef <- IO.mkRef (none : Option UInt64)
   let dependencies <- IO.mkRef #[]
   let hasValue := do pure ((<- valueRef.get).isSome)
+  let clearValue := Incr.clearValueRef valueRef
   let recompute := fun stabilization => do
     let deps <- dependencies.get
     for dependency in deps do
       dependency.fireIfChanged stabilization
     let value <- compute
-    Internal.writeValue valueRef cutoffRef value
-  let id <- Internal.State.registerNode state NodeKind.expert #[] recompute hasValue true
+    Internal.writeValue valueRef cutoffRef digestRef value
+  let id <- Internal.State.registerNode state NodeKind.expert #[] recompute hasValue clearValue true true
+  let generation <- Internal.State.nodeGeneration state id
   pure {
     state := state,
-    incr := { state := state, id := id, valueRef := valueRef, cutoffRef := cutoffRef },
+    incr := { state := state, id := id, generation := generation, valueRef := valueRef, cutoffRef := cutoffRef, digestRef := digestRef },
     dependencies := dependencies
   }
 
 /-- Add a dynamic dependency to an expert node. -/
 def addDependency (node : Node α) (dependency : Dependency β) : IO Unit := do
+  Incr.ensureCurrent dependency.node
   let deps <- node.dependencies.get
   if deps.any (fun existing => existing.nodeId == dependency.node.id) then
     pure ()
@@ -95,7 +109,7 @@ def makeStale (node : Node α) : IO Unit := do
 /-- Invalidate an expert node's cached value and mark it stale. -/
 def invalidate (node : Node α) : IO Unit := do
   node.incr.valueRef.set none
-  Internal.State.modifyInfo node.state node.incr.id (fun info => { info with valid := false, stale := true, computedAt := none })
+  Internal.State.invalidateNodeWith node.state node.incr.id
   if (← Incr.isNecessary node.incr) && (← State.amStabilizing node.state) then
     Internal.State.enqueueRecompute node.state node.incr.id
 

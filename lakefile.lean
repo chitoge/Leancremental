@@ -9,7 +9,19 @@ package leancremental where
 lean_lib Leancremental where
 
 lean_lib TestsSupport where
-  roots := #[`Tests.Util, `Tests.Core, `Tests.Query, `Tests.Pure, `Tests.TutorialExamples]
+  roots := #[`Tests.Util, `Tests.Core, `Tests.Query, `Tests.Pure, `Tests.TutorialExamples, `Tests.Actions, `Tests.ConceptsExamples, `Tests.CookbookExamples]
 
 lean_exe tests where
   root := `Tests
+
+lean_exe proptests where
+  root := `Tests.Prop
+
+lean_exe benchScaling where
+  root := `Tests.BenchSize
+
+lean_exe benchScaling2 where
+  root := `Tests.BenchPropagation
+
+lean_exe benchScaling3 where
+  root := `Tests.BenchAggregate

@@ -29,7 +29,10 @@ def nodeInfo
     valid := true,
     computedAt := none,
     changedAt := none,
-    visitingAt := none }
+    visitingAt := none,
+    lastAccessedAt := none,
+    externalDirtyReason := none,
+    tags := #[] }
 
 /-- Metadata for a leaf node such as `const` or `var`. -/
 def leaf (id : Nat) (kind : NodeKind) (necessary stale : Bool := false) : NodeInfo :=

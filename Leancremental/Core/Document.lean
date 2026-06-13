@@ -20,7 +20,7 @@ structure Versioned (α : Type) where
   value : α
 deriving Repr, BEq
 
-/-- A point-in-time document snapshot read outside the graph. -/
+/-- A point-in-time document snapshot read outside the incremental graph. -/
 structure Snapshot (α : Type) where
   /-- Current document version. -/
   version : Nat
@@ -36,7 +36,9 @@ structure RequestToken where
   version : Nat
 deriving Repr, BEq
 
-/-- Mutable document content plus an incremental version. -/
+/--
+Document handle containing mutable content and an incremental version counter.
+-/
 structure Handle (α : Type) where
   /-- State that owns the document variables. -/
   state : State
@@ -59,15 +61,15 @@ def watchContent (doc : Handle α) : Incr α :=
 def watchVersion (doc : Handle α) : Incr Nat :=
   Var.watch doc.version
 
-/-- Read the current document version outside the graph. -/
+/-- Read the current document version directly, outside the incremental graph. -/
 def currentVersion (doc : Handle α) : IO Nat :=
   Var.value doc.version
 
-/-- Read the current document content outside the graph. -/
+/-- Read the current document content directly, outside the incremental graph. -/
 def currentContent (doc : Handle α) : IO α :=
   Var.value doc.content
 
-/-- Read a point-in-time document snapshot outside the graph. -/
+/-- Read the current content and version together outside the incremental graph. -/
 def snapshot (doc : Handle α) : IO (Snapshot α) := do
   pure { version := (← currentVersion doc), content := (← currentContent doc) }
 
@@ -83,11 +85,14 @@ def edit (doc : Handle α) (f : α -> α) : IO Nat := do
   set doc nextVersion nextContent
   pure nextVersion
 
-/-- Tag a query result with the current document version. -/
+/-- Tag a query result with the document version used to compute it. -/
 def tag (doc : Handle γ) (node : Incr α) : IO (Incr (Versioned α)) :=
   Leancremental.map2 (watchVersion doc) node (fun version value => { version := version, value := value })
 
-/-- Convert a versioned value to an error if it is not for the current document version. -/
+/--
+Reject a versioned value when it no longer matches the document's current
+version.
+-/
 def requireCurrent (doc : Handle γ) (node : Incr (Versioned α)) : IO (Incr (Except String α)) :=
   Leancremental.map2 (watchVersion doc) node (fun currentVersion versioned =>
     if versioned.version == currentVersion then
@@ -99,7 +104,7 @@ def requireCurrent (doc : Handle γ) (node : Incr (Versioned α)) : IO (Incr (Ex
 def requestToken (doc : Handle α) (id : Nat) : IO RequestToken := do
   pure { id := id, version := (← currentVersion doc) }
 
-/-- Return whether a request token still targets the current document version. -/
+/-- Return whether a request token still matches the current document version. -/
 def requestIsCurrent (doc : Handle α) (token : RequestToken) : IO Bool := do
   pure ((← currentVersion doc) == token.version)
 

@@ -1,34 +1,36 @@
 # Leancremental
 
-Leancremental is a Lean 4 library for building self-adjusting computations. It is
-inspired by [Jane Street's OCaml `incremental` library](https://github.com/janestreet/incremental): you build a graph of
-values, update mutable inputs, then explicitly stabilize the graph to refresh the
-observed results.
+Leancremental is a Lean 4 library for incremental computation.
 
-Use it when you have derived values that should be recomputed only when their
-inputs change. The intended long-term use case is query-style tooling: parsers,
-interpreters, compilers, diagnostics, semantic tokens, and LSP requests that need
-to react quickly to edits.
+You build a graph of derived values, change mutable inputs, and then call
+`State.stabilize` to refresh the observed results. Only the observed part of the
+graph is recomputed.
 
-For a longer walkthrough and an OCaml Incremental parity checklist, see
-[TUTORIAL.md](TUTORIAL.md).
+It is aimed at workloads where you repeatedly answer derived questions after
+small edits:
 
-Lean API documentation is published from CI to
+- parsers and interpreters
+- compiler queries
+- diagnostics and semantic tokens
+- editor and LSP services
+
+Leancremental is inspired by Jane Street's OCaml `incremental` library, but you
+do not need prior OCaml Incremental knowledge to use it.
+
+Lean API documentation is published at
 [GitHub Pages](https://chitoge.github.io/Leancremental/).
 
-## Status
+## Start Here
 
-This is an experimental Lean implementation, but it is already usable for small
-incremental graphs and query-engine prototypes. The runtime supports variables,
-observers, cutoffs, dynamic dependencies, query memoization, budgeted
-stabilization, graph debugging, clocks, expert nodes, and a proof-oriented pure
-model.
+Recommended reading order:
 
-The proof layer is intentionally honest about its current boundary. Leancremental
-has executable invariant checkers and several Lean theorems about pure models,
-metadata shapes, graph invariants, cutoffs, and query helpers. It does not yet
-contain a static theorem that the mutable `IO.Ref` runtime always implements the
-pure semantics after stabilization.
+1. this README
+2. [CONCEPTS.md](CONCEPTS.md)
+3. [COOKBOOK.md](COOKBOOK.md)
+4. [TUTORIAL.md](TUTORIAL.md)
+
+`CONCEPTS.md` defines the vocabulary. `COOKBOOK.md` gives small task-oriented
+examples. `TUTORIAL.md` is longer and more explanatory.
 
 ## Quick Start
 
@@ -53,167 +55,245 @@ def example : IO Nat := do
   Observer.value! observer
 ```
 
-The final value is `36`. The important points are:
+This returns `36`.
 
-- `State.create` creates an incremental graph.
-- `Var.create` creates mutable inputs owned by that graph.
-- `Var.watch` turns a variable into an incremental value.
-- `map2` builds a derived value.
-- `observe` makes a value necessary.
-- `State.stabilize` recomputes necessary stale values.
-- `Observer.value!` reads the latest stabilized result.
+What happened:
+
+- `State.create` creates one incremental world.
+- `Var.create` creates mutable input variables.
+- `Var.watch` turns a variable into an incremental node.
+- `map2` builds a derived node.
+- `observe` marks a value as necessary.
+- `State.stabilize` propagates pending changes.
+- `Observer.value!` reads the latest stable value.
 
 ## Mental Model
 
-A Leancremental program has three phases.
+Most programs follow the same loop:
 
-1. Build a graph of `Incr α` values from variables and combinators.
+1. Build a graph of `Incr α` values.
 2. Change inputs with `Var.set` or `Var.replace`.
-3. Call `State.stabilize` to propagate changes to active observers.
+3. Call `State.stabilize`.
+4. Read observers.
 
-Only observed values are necessary. Necessary nodes keep their dependencies live,
-and stale necessary nodes are scheduled through a height-ordered recompute queue.
-That mirrors the central discipline of OCaml Incremental: dependencies should be
-stable before their parents recompute.
+Two rules matter most:
 
-The API lives in `IO`. OCaml Incremental hides graph mutation behind a functorized
-interface; Leancremental keeps mutation explicit because the runtime stores graph
-state in `IO.Ref`s.
+- Setting a variable does not immediately update dependents.
+- Unobserved work is allowed to stay stale.
 
-## Core Runtime
+That makes the API predictable: updates are explicit, and recomputation happens
+only when you ask for it.
 
-Importing `Leancremental` gives access to the main runtime API.
+## Core Terms
 
-Basic graph construction:
+These names appear throughout the code and docs:
 
-- `State.create`
-- `Var.create`, `Var.watch`, `Var.set`, `Var.replace`, `Var.value`
-- `const`, `ret`
-- `map`, `map2`, `map3`, `map4`, `map5`, `both`
-- `arrayFold`, `all`, `forAll`, `existsAny`, `sum`, `sumNat`, `sumFloat`
+- `State`: one incremental world
+- `Var α`: a mutable input variable
+- `Incr α`: a graph node that can produce a value of type `α`
+- `Observer α`: a handle for reading an incremental value from outside the graph
+- `necessary`: a node needed by some active observer
+- `stale`: a node whose cached value may need recomputation
+- `stabilize`: the step that propagates pending changes
 
-Dynamic graph structure:
+If these terms are still fuzzy, read [CONCEPTS.md](CONCEPTS.md) before diving
+into the larger tutorial.
 
-- `bind`, `join`, `ifThenElse`
-- `dependOn`
-- `freeze`, `freezeWhen`
+## What Leancremental Feels Like
 
-Observation and propagation:
+Useful mental models:
 
-- `observe`
-- `Observer.value?`, `Observer.value!`, `Observer.onUpdate`
-- `Observer.disallowFutureUse`
-- `State.stabilize`
-- `State.stabilizeWithStats`
-- `State.stabilizeWithBudget`, `State.cancelStabilization`
-- `Incr.staleValue?`
-- `Incr.onObservabilityChange`
+- a spreadsheet where cells depend on other cells
+- a build system where targets depend on source files
+- a dataflow graph that updates after edits
 
-Cutoffs:
+The main difference from a spreadsheet is that Leancremental does **not**
+recompute immediately after every edit. You explicitly call `State.stabilize`
+when you want pending changes to propagate.
 
-```lean
-Incr.setCutoff someNode Cutoff.ofEq
+```mermaid
+flowchart LR
+    A[Var.set] --> B[mark stale]
+    B --> C[State.stabilize]
+    C --> D[Observer.value!]
 ```
 
-Leancremental uses `Cutoff.never` by default. Unlike OCaml Incremental, it does
-not assume a uniform physical-equality cutoff for arbitrary Lean values. Use
-`Cutoff.ofEq` or `Cutoff.ofDecidableEq` when equality-based propagation is what
-you want.
+## Main API
 
-## Query And LSP Support
+These are the pieces most users need first.
 
-The library includes a small set of APIs aimed at compiler and editor workloads.
+Graph construction:
 
-- `MemoTable` reuses graph nodes for stable query keys.
-- `MemoScope` tracks request- or owner-local memoized keys and can clear them.
-- `Incr.staleValue?` reads the last cached value while edits are pending.
-- `State.stabilizeWithStats` reports stabilization counts and touched nodes.
-- `State.stabilizeWithBudget` lets clients split stabilization across latency
-  budgets and resume later.
-- `IndexedAggregate` keeps a stable keyed aggregate node for diagnostics,
-  symbols, semantic tokens, and similar outputs.
-- `IncrResult` keeps expected failures in the graph as `Except` values instead
-  of throwing `IO` exceptions.
-- `Document` tags query results with lightweight document versions and request
-  tokens, so stale responses can be rejected before publishing.
+- [`State.create`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.State.create)
+- [`Var.create`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.Var.create), [`Var.watch`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.Var.watch), [`Var.set`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.Var.set), [`Var.replace`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.Var.replace), [`Var.value`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.Var.value)
+- [`const`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.const), [`ret`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.ret)
+- [`map`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.map), [`map2`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.map2), [`map3`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.map3), [`map4`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.map4), [`map5`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.map5), [`both`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.both)
+- [`arrayFold`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.arrayFold), [`all`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.all), [`forAll`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.forAll), [`existsAny`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.existsAny), [`sum`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.sum), [`sumNat`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.sumNat), [`sumFloat`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.sumFloat)
 
-These APIs are intentionally modest. They do not provide persistent multi-version
-execution or graph garbage collection yet.
+Dynamic structure:
 
-## Debugging And Invariants
+- [`bind`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.bind), [`join`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.join), [`ifThenElse`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.ifThenElse)
+- [`dependOn`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.dependOn)
+- [`freeze`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.freeze), [`freezeWhen`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.freezeWhen)
 
-The runtime exposes executable diagnostics:
+Observation:
 
-- `State.toDot` and `State.saveDotToFile` export the graph.
-- `State.detectCycle` reports cycle paths.
-- `State.checkInvariants` checks basic graph metadata invariants.
-- `State.checkStableInvariants` additionally checks post-stabilization
-  invariants for necessary nodes.
+- [`observe`](https://chitoge.github.io/Leancremental/Leancremental/Core/Observer.html#Leancremental.observe)
+- [`Observer.value?`](https://chitoge.github.io/Leancremental/Leancremental/Core/Observer.html#Leancremental.Observer.value?), [`Observer.value!`](https://chitoge.github.io/Leancremental/Leancremental/Core/Observer.html#Leancremental.Observer.value!), [`Observer.onUpdate`](https://chitoge.github.io/Leancremental/Leancremental/Core/Observer.html#Leancremental.Observer.onUpdate)
+- [`Observer.disallowFutureUse`](https://chitoge.github.io/Leancremental/Leancremental/Core/Observer.html#Leancremental.Observer.disallowFutureUse)
+- [`State.stabilize`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.State.stabilize)
+- [`State.stabilizeWithStats`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.State.stabilizeWithStats)
+- [`State.stabilizeWithBudget`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.State.stabilizeWithBudget), [`State.cancelStabilization`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.State.cancelStabilization)
 
-The invariant checks cover facts represented by public `NodeInfo` snapshots:
-parents and children agree, parent heights are greater than child heights,
-necessary nodes are closed over dependencies, timestamps are ordered, and stable
-necessary nodes are no longer stale.
+## First Questions People Usually Have
 
-## Clocks And Expert Nodes
+### Why do I need `observe`?
 
-`Clock` provides deterministic time-based incrementals over `Nat` time. Time only
-changes when user code calls `Clock.advanceTo` or `Clock.advanceBy`, and those
-changes propagate on the next stabilization.
+Leancremental only keeps observed results up to date. If nothing is observed,
+the library is allowed to leave the graph alone.
 
-`Expert.Node` is a low-level escape hatch for custom recomputation. Expert nodes
-can have dynamic dependencies and dependency callbacks. Prefer ordinary typed
-combinators unless you need custom incremental maintenance.
+### Why do I need `State.stabilize`?
 
-## Pure Model And Proofs
+`Var.set` marks work as stale. `State.stabilize` performs the recomputation.
 
-`Leancremental.Pure` is a total expression language for reasoning about the pure
-subset of the API. It models constants, `map`, `map2`, folds, boolean folds,
-`sumNat`, variables as explicit values, and snapshots whose stored value is
-proved equal to the expression's evaluation.
+### What should I read from outside the graph?
 
-`CoreSnapshot` is the bridge between the pure model and the executable runtime:
+Usually an `Observer`. Reading through an observer gives you the last stable
+value of an observed node.
 
-- `CoreSnapshot.compile` builds executable `const`, `map`, and `map2` graphs from
-  a `Pure.Expr`.
-- `CoreSnapshot.compileFoldArray` builds executable fold graphs from pure inputs.
-- `CoreSnapshot.observeExpr` and `CoreSnapshot.observeFoldArray` compile and
-  observe those graphs.
-- `CoreSnapshot.observeExprChecked` and `CoreSnapshot.observeFoldArrayChecked`
-  run the actual graph, stabilize it, and fail if the observed value does not
-  match the pure model.
-- `CoreSnapshot.certifyValue` and `CoreSnapshot.certifyFoldValue` turn a matching
-  observed value into a proof-carrying `Pure.Snapshot`, assuming a lawful `BEq`.
+### When should I use `bind` instead of `map`?
 
-`CoreSnapshot.stableValueSnapshot` is deliberately weaker: it wraps an already
-read value in a trivial constant pure model. It does not prove that the value came
-from any non-trivial computation graph.
+Use `map` when the graph shape stays the same and only values change.
 
-`Leancremental.Proof` collects the current proof layer:
+Use `bind` when the next dependency depends on the current value, so the graph
+itself may need to change shape.
 
-- cutoff simplification lemmas
-- Prop-level graph invariant records over `NodeInfo`
-- height-order facts and child-cycle exclusion
-- pure expression height and node-count facts
-- expected-value and certification lemmas for `CoreSnapshot`
-- local metadata-constructor lemmas for leaf, unary, and binary nodes
-- query-helper lemmas for memo key tracking, indexed aggregates, and
-  `IncrResult.cutoffOfEq`
+## Thread Safety
 
-The next serious proof milestone is to lift the pure metadata preservation lemmas
-to larger `IO` state transitions and eventually prove static correctness theorems
-for stabilization itself.
+Leancremental uses internal locking, but that does not mean every operation is
+intended for free-for-all concurrent use.
 
-## Project Layout
+The practical model is:
 
-- [Leancremental.lean](Leancremental.lean) is the public umbrella import.
-- [Leancremental/Core.lean](Leancremental/Core.lean) re-exports the runtime.
-- [Leancremental/Pure.lean](Leancremental/Pure.lean) contains the total pure
-  expression model.
-- [Leancremental/Proof.lean](Leancremental/Proof.lean) re-exports proof modules.
-- [Tests.lean](Tests.lean) is the executable test runner.
-- [Tests/TutorialExamples.lean](Tests/TutorialExamples.lean) checks the tutorial
-  snippets.
+- [`State.stabilize`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.State.stabilize), [`Var.set`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.Var.set), and other graph mutations serialize through the
+  state's write lock.
+- Observer reads such as [`Observer.value!`](https://chitoge.github.io/Leancremental/Leancremental/Core/Observer.html#Leancremental.Observer.value!) use the read side of the state lock.
+- Some direct reads, such as [`Var.value`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.Var.value), intentionally do **not** take that
+  lock and therefore are not synchronized snapshots of the stabilized graph.
+- Graph construction is not documented as generally thread-safe.
+- A few advanced APIs have explicit concurrency caveats in their docstrings.
+
+If you want predictable behavior, use this rule of thumb:
+
+1. build or mutate the graph from one coordination point
+2. call `State.stabilize`
+3. read results through observers
+
+For fine-grained details, see the docstrings on [`Var.value`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.Var.value),
+[`State.nodesWithTag`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.State.nodesWithTag), [`State.staleNecessaryIds`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.State.staleNecessaryIds), and [`Expert.Node.create`](https://chitoge.github.io/Leancremental/Leancremental/Core/Expert.html#Leancremental.Expert.Node.create).
+
+## Complexity Notes
+
+Leancremental does not yet provide a full formal complexity table for the public
+API, but the high-level behavior is:
+
+- [`map`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.map), [`map2`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.map2), [`map3`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.map3), [`map4`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.map4), and [`map5`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.map5) add one derived node each.
+- [`arrayFold`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.arrayFold) is a full recompute fold: if any input changes, the whole fold is
+  recomputed on the next stabilization.
+- [`State.stabilizeWithBudget`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.State.stabilizeWithBudget) lets you cap work by recompute roots rather than
+  running a full pass at once.
+- [`MemoTable`](https://chitoge.github.io/Leancremental/Leancremental/Core/Memo.html#Leancremental.MemoTable) avoids duplicate graph construction for repeated keys.
+- Some state-inspection helpers, such as [`State.lastPassCounters`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.State.lastPassCounters), are O(1),
+  while others, such as full stabilization stats, scan more state.
+
+When a cost matters, prefer the API docstring over assumptions. The current docs
+call out complexity where the cost would otherwise be surprising.
+
+## Cutoffs
+
+A cutoff decides whether a recomputed value should count as "changed".
+
+Leancremental defaults to `Cutoff.never`, which means every recomputation
+propagates. For real workloads, choose a cutoff when equality or version checks
+are cheap enough to avoid unnecessary downstream work.
+
+Common choices:
+
+- [`Cutoff.ofEq`](https://chitoge.github.io/Leancremental/Leancremental/Core/Types.html#Leancremental.Cutoff.ofEq) for small exact values
+- [`Cutoff.ofDecidableEq`](https://chitoge.github.io/Leancremental/Leancremental/Core/Types.html#Leancremental.Cutoff.ofDecidableEq) when you already have `DecidableEq`
+- [`Cutoff.ofHash`](https://chitoge.github.io/Leancremental/Leancremental/Core/Types.html#Leancremental.Cutoff.ofHash) when a hash is cheap and `BEq` is available
+- [`Cutoff.ofHashUnchecked`](https://chitoge.github.io/Leancremental/Leancremental/Core/Types.html#Leancremental.Cutoff.ofHashUnchecked) only when you explicitly accept collision risk
+
+Example:
+
+```lean
+let digest <- map source computeDigest Cutoff.ofHash
+let versioned <- map source projectVersion Cutoff.ofEq
+```
+
+## Query-Oriented Features
+
+Leancremental includes extra support for compiler-style and editor-style
+workloads:
+
+- [`MemoTable`](https://chitoge.github.io/Leancremental/Leancremental/Core/Memo.html#Leancremental.MemoTable) reuses graph nodes for stable query keys.
+- [`MemoScope`](https://chitoge.github.io/Leancremental/Leancremental/Core/Memo.html#Leancremental.MemoScope) tracks request-local memoized keys and clears them in batches.
+- [`Incr.staleValue?`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.Incr.staleValue?) reads the last cached value while newer edits are pending.
+- [`State.stabilizeWithBudget`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.State.stabilizeWithBudget) lets clients split work across latency budgets.
+- [`IndexedAggregate`](https://chitoge.github.io/Leancremental/Leancremental/Core/Aggregate.html#Leancremental.IndexedAggregate) and [`AssocIndexedAggregate`](https://chitoge.github.io/Leancremental/Leancremental/Core/Aggregate.html#Leancremental.AssocIndexedAggregate) support keyed outputs such as
+  diagnostics or semantic tokens.
+- [`IncrResult`](https://chitoge.github.io/Leancremental/Leancremental/Core/Result.html#Leancremental.IncrResult) keeps expected failures inside the graph as `Except` values.
+- [`Document`](https://chitoge.github.io/Leancremental/Leancremental/Core/Document.html#Leancremental.Document) tags query results with document versions and request tokens.
+
+If you are building a query engine, start with the tutorial sections on
+memoization and query-style interpreters.
+
+## Debugging And Checks
+
+The runtime exposes a small diagnostics surface:
+
+- [`State.toDot`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.State.toDot) and [`State.saveDotToFile`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.State.saveDotToFile) export the graph.
+- [`State.detectCycle`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.State.detectCycle) reports cycle paths.
+- [`State.checkInvariants`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.State.checkInvariants) checks basic graph metadata invariants.
+- [`State.checkStableInvariants`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.State.checkStableInvariants) checks stronger post-stabilization invariants.
+- [`State.traceEvents`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.State.traceEvents) exposes structured scheduler-facing trace records.
+
+## Proof Surface
+
+Leancremental also includes a pure model for theorem work.
+
+- [`Leancremental.Pure`](https://chitoge.github.io/Leancremental/Leancremental/Pure.html) is a total expression language for the pure subset.
+- [`CoreSnapshot`](https://chitoge.github.io/Leancremental/Leancremental/Core/Snapshot.html#Leancremental.CoreSnapshot) connects pure expressions to executable graphs.
+- [`Leancremental.Proof`](https://chitoge.github.io/Leancremental/Leancremental/Proof.html) collects the current theorem layer.
+
+This proof layer is useful today, but it does not yet prove that the mutable
+`IO.Ref` runtime always implements the pure semantics after stabilization.
+
+## Where To Read Next
+
+- [CONCEPTS.md](CONCEPTS.md): plain-language definitions of the main runtime terms
+- [COOKBOOK.md](COOKBOOK.md): small task-oriented examples
+- [TUTORIAL.md](TUTORIAL.md): a worked introduction with executable examples
+- [Leancremental.lean](Leancremental.lean): public umbrella import
+- [Leancremental/Core.lean](Leancremental/Core.lean): runtime API re-export
+- [Leancremental/Pure.lean](Leancremental/Pure.lean): pure model
+- [Leancremental/Proof.lean](Leancremental/Proof.lean): proof modules
+
+## Status
+
+This is still an experimental library, but it is usable for small incremental
+graphs and query-engine prototypes.
+
+Current runtime support includes:
+
+- variables and observers
+- dynamic dependencies
+- cutoffs
+- query memoization
+- budgeted stabilization
+- graph export and invariant checks
+- clocks and expert nodes
+- a proof-oriented pure model
 
 ## Development
 

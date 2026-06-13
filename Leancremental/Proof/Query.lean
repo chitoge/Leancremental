@@ -33,6 +33,14 @@ theorem memoContainsKey_push_other [BEq κ]
     memoContainsKey (keys.push inserted) query = memoContainsKey keys query := by
   simp [memoContainsKey, different]
 
+/-- Conditionally inserting a key when missing guarantees that key is present. -/
+theorem memoContainsKey_insertIfMissing_same [BEq κ] [ReflBEq κ]
+    (keys : Array κ) (key : κ) :
+    memoContainsKey (if memoContainsKey keys key then keys else keys.push key) key = true := by
+  by_cases h : memoContainsKey keys key
+  · simp [h]
+  · simp [h, memoContainsKey_push_same]
+
 /-- Boolean aggregate key lookup is equivalent to a matching indexed entry. -/
 theorem aggregateContainsKey_eq_true [BEq κ]
     (entries : Array (κ × Incr α)) (key : κ) :

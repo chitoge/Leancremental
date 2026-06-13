@@ -3,6 +3,7 @@ import Leancremental.Core.Internal
 import Leancremental.Core.State
 import Leancremental.Core.Basic
 import Leancremental.Core.Memo
+import Leancremental.Core.Query
 import Leancremental.Core.Aggregate
 import Leancremental.Core.Result
 import Leancremental.Core.Document
@@ -13,11 +14,10 @@ import Leancremental.Core.Invariant
 import Leancremental.Core.Snapshot
 
 /-!
-Leancremental's executable incremental graph engine.
+Leancremental's executable incremental runtime.
 
-The API mirrors the core ideas of Jane Street's Incremental library in Lean 4:
-mutable input variables, explicit stabilization, observed values, cutoff
-functions, dynamically changing dependencies, clocks, expert nodes, and a bridge
-from stable executable values into the pure proof model. It also exposes
-OCaml-Incremental-inspired graph invariant checks for proof and debugging work.
+Import this module when you want to build and run incremental graphs in `IO`.
+It provides mutable input variables, explicit stabilization, observers, cutoffs,
+dynamic dependencies, memoization helpers, clocks, expert nodes, and debugging
+support.
 -/
