@@ -1,16 +1,13 @@
-# Leancremental Cookbook
+# Cookbook
 
-This file is a small collection of task-oriented examples.
+This file collects short task-oriented recipes.
 
-Each example answers a concrete question like "how do I sum two changing
-inputs?" without requiring you to read the whole tutorial first.
+Each recipe answers a concrete usage question without requiring the full
+explanatory path of the tutorial.
 
-## 1. Sum Two Mutable Inputs
+## Recipe 1 — Sum Two Mutable Inputs
 
-Problem:
-
-- you have two changing numbers
-- you want to read their sum after edits
+Use this when two mutable inputs feed one derived value.
 
 ```lean
 import Leancremental
@@ -30,16 +27,14 @@ def sumTwo : IO Nat := do
   Observer.value! observer
 ```
 
-Result:
+Outcome: `35`
 
-- the final value is `35`
+Key point: updates become visible after stabilization, not at `Var.set` time.
 
-## 2. Read A Value Only After Stabilization
+## Recipe 2 — Read Only After Stabilization
 
-Problem:
-
-- you changed an input
-- you want to understand why the observer still shows the old value
+Use this when a direct input update has happened but observer output still looks
+old.
 
 ```lean
 def readAfterStabilize : IO (Nat × Nat) := do
@@ -56,21 +51,16 @@ def readAfterStabilize : IO (Nat × Nat) := do
   pure (before, after)
 ```
 
-Result:
+Outcome:
 
 - `before = 2`
 - `after = 20`
 
-Lesson:
+Key point: `Var.set` marks work stale; `State.stabilize` performs the refresh.
 
-- `Var.set` marks work stale
-- `State.stabilize` performs the recomputation
+## Recipe 3 — Switch Between Two Branches
 
-## 3. Switch Between Two Branches
-
-Problem:
-
-- you want the result to follow one of two inputs depending on a boolean
+Use this when the active dependency should depend on a boolean or selector.
 
 ```lean
 def switching : IO Nat := do
@@ -88,20 +78,14 @@ def switching : IO Nat := do
   Observer.value! observer
 ```
 
-Result:
+Outcome: `100`
 
-- the final value is `100`
+Key point: `ifThenElse` is built on `bind`, so only the active branch stays
+necessary.
 
-Lesson:
+## Recipe 4 — Reuse Work For Repeated Query Keys
 
-- `ifThenElse` is built on `bind`
-- only the selected branch is necessary
-
-## 4. Reuse Work For Repeated Query Keys
-
-Problem:
-
-- asking for the same query key repeatedly should reuse one graph node
+Use this when repeated requests for the same key should reuse one node.
 
 ```lean
 def memoizedQuery : IO (Nat × Bool) := do
@@ -120,21 +104,14 @@ def memoizedQuery : IO (Nat × Bool) := do
   pure (← counter.get, first.id == second.id)
 ```
 
-Result:
+Outcome: `(1, true)`
 
-- the final value is `(1, true)`
+Key point: `MemoTable.getOrCreate` reuses the existing node for the same key.
 
-Lesson:
+## Recipe 5 — Reject A Stale Document Result
 
-- the computation for `"file:A"` ran once
-- the second call reused the same memoized node instead of building another one
-
-## 5. Reject A Stale Document Result
-
-Problem:
-
-- you have a query result tied to one document version
-- you want to refuse to use it after the document changes
+Use this when a result is tied to one document version and must not be used
+after the document changes.
 
 ```lean
 def staleDocumentResult : IO (Except String Nat) := do
@@ -150,18 +127,13 @@ def staleDocumentResult : IO (Except String Nat) := do
   Observer.value! observer
 ```
 
-Result:
+Outcome: an error value
 
-- the final value is an error, because the value was tagged with the old
-  document version
+Key point: `Document.requireCurrent` checks a version-tagged value against the
+current document version.
 
-Lesson:
-
-- `Document.requireCurrent` checks a version-tagged value against the current
-  document version
-
-If you want to suppress stale replies from outside the graph, use a request
-token instead:
+If code outside the graph needs to drop stale replies instead, use a request
+token:
 
 ```lean
 def staleRequestToken : IO Bool := do
@@ -172,20 +144,12 @@ def staleRequestToken : IO Bool := do
   Document.requestIsCurrent doc token
 ```
 
-Result:
+Outcome: `false`
 
-- the final value is `false`
+## Recipe 6 — Keep A Last Known Value While New Work Is Pending
 
-Lesson:
-
-- `Document.requestToken` captures the version a client request started from
-- `Document.requestIsCurrent` tells you whether it is still safe to publish the reply
-
-## 6. Keep A Last Known Value While New Work Is Pending
-
-Problem:
-
-- you want to show the old answer while a newer stabilization has not run yet
+Use this when an old cached answer is acceptable while a newer stabilization is
+still pending.
 
 ```lean
 def staleFallback : IO (Option Nat × Nat) := do
@@ -202,21 +166,17 @@ def staleFallback : IO (Option Nat × Nat) := do
   pure (oldValue, newValue)
 ```
 
-Result:
+Outcome:
 
 - `oldValue = some 6`
 - `newValue = 20`
 
-Lesson:
+Key point: `Incr.staleValue?` reads the cached value even while the node is stale.
 
-- `Incr.staleValue?` reads the cached value even while the node is stale
+## Recipe 7 — Invalidate One Memo Key
 
-## 7. Invalidate A Single Memo Key
-
-Problem:
-
-- one file changed and you want to force the next lookup to rebuild, without
-  touching the rest of the table
+Use this when one key should rebuild on the next lookup without disturbing the
+rest of the table.
 
 ```lean
 def memoInvalidate : IO (Nat × Bool × Nat) := do
@@ -230,24 +190,17 @@ def memoInvalidate : IO (Nat × Bool × Nat) := do
   pure (sizeBefore, wasPresent, sizeAfter)
 ```
 
-Result:
+Outcome:
 
 - `sizeBefore = 2`
 - `wasPresent = true`
 - `sizeAfter = 1`
 
-Lesson:
+Key point: invalidation removes one table entry; later lookups rebuild it.
 
-- `MemoTable.invalidate` removes one key and returns whether it existed
-- existing observers of the removed node keep working; the next
-  `getOrCreate` for that key will build a fresh node
+## Recipe 8 — Clear Request-Local Entries With `MemoScope`
 
-## 8. Clear Request-Local Entries With MemoScope
-
-Problem:
-
-- one request finishes and you want to remove its memoized entries without
-  touching entries that belong to other requests
+Use this when request-local memoized entries should be removed in one step.
 
 ```lean
 def memoScopeClear : IO (Nat × Nat × Nat) := do
@@ -263,25 +216,18 @@ def memoScopeClear : IO (Nat × Nat × Nat) := do
   pure (before, removed, after)
 ```
 
-Result:
+Outcome:
 
 - `before = 3`
 - `removed = 2`
 - `after = 1`
 
-Lesson:
+Key point: the shared entry survives; only the scope-tracked entries are cleared.
 
-- `MemoScope.getOrCreate` adds the key to both the shared table and the
-  scope's key list
-- `MemoScope.clear` invalidates only the scope-tracked keys; the shared
-  entry survives
+## Recipe 9 — Preload Memo Values Into A Fresh State
 
-## 9. Carry Memo Values Into A Fresh State With MemoValueCodec
-
-Problem:
-
-- you want to pass computed stable values from one `State` into a fresh one
-  without rerunning the computation
+Use this when stable memoized values should be carried into a fresh `State`
+without recomputing them.
 
 ```lean
 def memoCodecRoundtrip : IO (Option String) := do
@@ -305,95 +251,48 @@ def memoCodecRoundtrip : IO (Option String) := do
   Observer.value? obs2
 ```
 
-Result:
+Outcome: `some "hello"`
 
-- the final value is `some "hello"`
+Key point: stable values can be persisted and reinstalled as preloaded `const`
+nodes in a new state.
 
-Lesson:
+## Recipe 10 — Stop Unnecessary Propagation With A Cutoff
 
-- `persistStableValues` reads the stable value of each memoized node and
-  encodes it through the codec into the snapshot store
-- `preloadConstValues` decodes those values and installs them as `const`
-  nodes so the next `getOrCreate` returns the preloaded result instead of
-  running the compute function again
-- `MemoValueCodec.ofJson` handles the encode/decode step for any type with
-  `ToJson` and `FromJson` instances; for file-backed persistence, swap
-  `MemoSnapshotStore.hashMap` for `MemoSnapshotStore.fileBacked`
-
-## 10. Stop Unnecessary Propagation With A Cutoff
-
-Problem:
-
-- a derived node recomputes to the same value as before, but its parents still
-  re-fire because the runtime does not know the value is unchanged
+Use this when a derived node often recomputes to the same value.
 
 ```lean
 def cutoffStop : IO (Nat × Nat) := do
   let state <- State.create
   let x <- Var.create state 1
-  -- Without a cutoff, setting x to the same value still propagates downstream.
-  -- Cutoff.ofEq stops propagation when the output equals the previous output.
   let doubled <- map (Var.watch x) (fun n => n * 2) Cutoff.ofEq
   let obs <- observe doubled
   State.stabilize state
   let before <- Observer.value! obs
-  Var.set x 1      -- same value
+  Var.set x 1
   State.stabilize state
   let after <- Observer.value! obs
   pure (before, after)
 ```
 
-Result:
+Outcome: `(2, 2)`
 
-- both values are `2`; downstream nodes do not refire because `Cutoff.ofEq` detected the equality
+Key point: `Cutoff.ofEq` stops the unchanged result from propagating again.
 
-Lesson:
+## Recipe 11 — Safe Federation Stabilize-And-Advance
 
-- the default [`Cutoff.never`](https://chitoge.github.io/Leancremental/Leancremental/Core/Types.html#Leancremental.Cutoff.never) propagates on every recompute, even when the value is unchanged
-- [`Cutoff.ofEq`](https://chitoge.github.io/Leancremental/Leancremental/Core/Types.html#Leancremental.Cutoff.ofEq) works for any type with a `BEq` instance and is the right default for most derived nodes
-- [`Cutoff.ofHash`](https://chitoge.github.io/Leancremental/Leancremental/Core/Types.html#Leancremental.Cutoff.ofHash) adds a hash pre-check for larger data where equality is expensive
-- set the cutoff at node construction; use [`Incr.setCutoff`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.Incr.setCutoff) to reconfigure later
-
-## Recipe 11 — Safe Federation Stabilize-and-Advance
-
-**Goal**: advance a `FederatedState`'s frontier after stabilization without
-racing against a concurrent `State.stabilize` on the same `localState`.
+Use this when a federated runtime must capture the stabilization number from one
+pass and advance its frontier without racing another stabilization.
 
 ```lean
--- Capture the epoch atomically with the stabilization pass.
 let stats ← State.stabilizeWithStats fs.localState
--- Pass it explicitly so no concurrent stabilize can change it under us.
 let newFrontier ← fs.advanceFrontierAt stats.stabilization
 ```
 
-`State.stabilizeWithStats` returns
-[`StabilizeStats`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.StabilizeStats)
-whose `.stabilization` is captured inside `stabilizeLocked`, before the write
-lock is released — the earliest safe read point. Passing it to
-[`FederatedState.advanceFrontierAt`](https://chitoge.github.io/Leancremental/Leancremental/Core/Federation.html#Leancremental.FederatedState.advanceFrontierAt)
-eliminates the window where a racing thread's `stabilize` could increment the
-epoch counter before `advanceFrontier` reads it.
+Key point: the stabilization number captured by `stabilizeWithStats` is safer
+than reading the current epoch later with `advanceFrontier`.
 
-**When `advanceFrontier` is fine**: when `localState` is driven by exactly one
-caller (the common single-agent case). The race only materialises when two
-threads call `State.stabilize` on the same `localState` between a pass
-completing and the subsequent frontier read.
+## Related Docs
 
-**Related**: for assembling a cluster-wide frontier from multiple agents' epochs
-without antichain loss, use
-[`FederatedState.globalFrontier`](https://chitoge.github.io/Leancremental/Leancremental/Core/Federation.html#Leancremental.FederatedState.globalFrontier)
-(see [`Proof.Federation.globalFrontier_covers_iff`](https://chitoge.github.io/Leancremental/Leancremental/Proof/Federation.html#Leancremental.Proof.Federation.globalFrontier_covers_iff)).
-
-## When To Read The Tutorial
-
-Use this cookbook when you want a quick pattern.
-
-Use [TUTORIAL.md](TUTORIAL.md) when you want:
-
-- the bigger mental model
-- more explanation of `necessary`, `Cutoff`, and `bind`
-- the advanced query and proof APIs
-
-Use [CONCURRENCY.md](CONCURRENCY.md) only if you plan to call `State.stabilize` with `parallel := true`.
-
-Use [FEDERATION.md](FEDERATION.md) only if you are coordinating multiple `State` instances across agents or processes.
+- Use [TUTORIAL.md](TUTORIAL.md) for the larger runtime model and longer explanations.
+- Use [CONCURRENCY.md](CONCURRENCY.md) only when calling `State.stabilize` with `parallel := true`.
+- Use [FEDERATION.md](FEDERATION.md) only when coordinating several independent `State` instances.

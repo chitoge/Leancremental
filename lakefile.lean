@@ -9,7 +9,7 @@ package leancremental where
 lean_lib Leancremental where
 
 lean_lib TestsSupport where
-  roots := #[`Tests.Util, `Tests.Core, `Tests.Query, `Tests.Pure, `Tests.TutorialExamples, `Tests.Actions, `Tests.ConceptsExamples, `Tests.CookbookExamples, `Tests.Parallel, `Tests.ConcurrencyExamples, `Tests.FederationExamples]
+  roots := #[`Tests.Util, `Tests.Core, `Tests.Query, `Tests.Pure, `Tests.TutorialExamples, `Tests.Actions, `Tests.ConceptsExamples, `Tests.CookbookExamples, `Tests.Parallel, `Tests.ConcurrencyExamples, `Tests.QueriesExamples, `Tests.FederationExamples]
 
 lean_exe tests where
   root := `Tests

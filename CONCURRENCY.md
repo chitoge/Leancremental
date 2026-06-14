@@ -1,72 +1,62 @@
 # Parallel Stabilization
 
-Leancremental can recompute independent graph nodes concurrently inside a single
-stabilization pass.
+This document covers one specific feature: running eligible node recomputation
+in parallel during a single `State.stabilize` pass.
 
-Most users do not need this page. If you always call `State.stabilize state`
-without `parallel := true`, you can skip it.
+It is not part of the default runtime path. If code always calls
+`State.stabilize state` without `parallel := true`, this page is optional.
 
 The executable snippets here are mirrored in
-[Tests/ConcurrencyExamples.lean](Tests/ConcurrencyExamples.lean), and the test
-executable runs them through
-`Leancremental.Tests.ConcurrencyExamples.runAll`.
+[Tests/ConcurrencyExamples.lean](Tests/ConcurrencyExamples.lean).
 
-## Short Version
+## What It Does
 
 By default, `State.stabilize` runs sequentially.
 
-If you call:
+```lean
+State.stabilize state
+```
+
+Parallel mode opts in to concurrent recomputation for eligible nodes:
 
 ```lean
 State.stabilize state true
 ```
 
-Leancremental will try to recompute independent work in parallel inside that
-single pass.
+The feature is about work **inside one stabilization pass**. It does not change
+the external API shape or the fact that one `State` remains one locked mutable
+runtime.
 
-For ordinary use, the main rule is simple:
+## When It Helps
 
-- pure `map`-style computations are fine in parallel mode
-- `bind`, `freeze`, and `Expert.Node` still run sequentially
-
-## When This Helps
-
-Parallel stabilization helps when:
+Parallel stabilization is most useful when:
 
 - many independent derived nodes become stale at once
-- those nodes are expensive enough that parallel work outweighs task overhead
-- you are already running Lean with more than one worker thread
+- those recomputations are large enough to outweigh task overhead
+- the program already runs with more than one Lean worker thread
 
 It helps less when:
 
-- the graph is mostly one long dependency chain
+- the graph is mostly one dependency chain
 - most stale work sits behind `bind` or `freeze`
-- each recomputation is tiny
+- recomputations are tiny
 
-## What The Runtime Uses To Do This Safely
+## Scheduling Model
 
-The runtime assigns every node a **height**.
+The runtime assigns each node a height.
 A node's height is greater than the height of its children.
 
-Plain-language consequence:
+Practical consequence:
 
 - nodes at the same height do not depend on each other
-- so the runtime can finish one height level, then move to the next
+- the runtime can process one height level and then move upward
 
-That is the whole idea behind parallel stabilization.
-The runtime works level by level:
+That is the basic scheduling idea behind parallel stabilization.
+It is an internal detail, but it explains why some work can run together safely.
 
-1. find the next height that has stale necessary nodes
-2. run the parallel-safe nodes at that height together
-3. finish the sequential-only nodes at that height
-4. move upward
+## What Can Run In Parallel
 
-You do not need to manage those levels yourself.
-They are internal scheduling details.
-
-## What Runs In Parallel
-
-These node kinds can run in parallel when they sit at the same height:
+These node kinds can run in parallel when they are at the same height:
 
 - `const`
 - `var`
@@ -79,19 +69,18 @@ These stay sequential:
 - `freeze`
 - `Expert.Node`
 
-Why:
+Reason:
 
-- `map`-style nodes just read their inputs and compute a result
+- `map`-style nodes read inputs and compute a value
 - `bind` and `freeze` can rewire graph structure
 - `Expert.Node` runs arbitrary user `IO`
 
-## What You Need To Remember As A User
+## User-Facing Rules
 
-### Pure `map`-style code is the normal safe case
+### Ordinary `map`-style code is the expected case
 
-The closures passed to `map`, `map2`, and related combinators are pure
-functions. That is the normal case, and it is the easiest case for parallel
-mode.
+The functions passed to `map`, `map2`, and related combinators are pure
+functions. That is the normal case for parallel mode.
 
 ```lean
 let doubled <- map (Var.watch x) (fun n => n * 2)
@@ -100,47 +89,28 @@ let squared <- map (Var.watch x) (fun n => n * n)
 State.stabilize state true
 ```
 
-### `Expert.Node` needs more care
+### `Expert.Node` remains a special case
 
-`Expert.Node` is not part of the parallel tier.
+`Expert.Node` does not enter the parallel tier.
 It still runs sequentially.
 
-That means parallel mode does **not** make `Expert.Node` compute functions race
-with each other inside one stabilization pass.
+The usual expert-node cautions still apply:
 
-The existing expert-node cautions still apply:
-
-- do not call `State.stabilize` from inside expert recomputation
-- do not call `Var.set` from inside expert recomputation
-- if your own code shares mutable state across threads, synchronize it explicitly
+- do not call `State.stabilize` inside expert recomputation
+- do not call `Var.set` inside expert recomputation
+- synchronize any shared mutable state that your own code manages across threads
 
 ## What Parallel Mode Does Not Change
 
-Parallel stabilization does **not** remove the global write lock.
+Parallel mode does not remove the global write lock.
+The externally visible behavior is still:
 
-The user-visible behavior is still:
-
-- one `State.stabilize` call produces one stable pass
+- one `State.stabilize` call produces one completed pass
 - observer callbacks run after recomputation finishes
-- concurrent `Var.set` and `State.stabilize` calls on the same `State` are still serialized
+- concurrent mutation and stabilization on the same `State` are still serialized
 
-So this feature is **intra-pass parallelism**, not general shared-state
-concurrency.
+## Related Docs
 
-## Practical Advice
-
-Use parallel mode when you have measured a real bottleneck and your stale work
-contains many independent `map`-style nodes.
-
-Stay with the default sequential mode when:
-
-- you are still learning the library
-- your workload is small
-- most of the graph's cost comes from dynamic rewiring rather than wide parallel work
-
-## Where To Read Next
-
-- [README.md](README.md) for the main public overview
-- [CONCEPTS.md](CONCEPTS.md) for the single-state runtime model
-- [FEDERATION.md](FEDERATION.md) for coordination across multiple `State` instances
-- [Leancremental/Core/State.lean](Leancremental/Core/State.lean) for the API details
+- [README.md](README.md)
+- [CONCEPTS.md](CONCEPTS.md)
+- [FEDERATION.md](FEDERATION.md)
