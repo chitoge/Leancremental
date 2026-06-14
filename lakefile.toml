@@ -1,0 +1,31 @@
+name = "leancremental"
+version = "0.4.1"
+keywords = ["incremental", "self-adjusting-computation", "reactive"]
+defaultTargets = ["Leancremental"]
+
+[[lean_lib]]
+name = "Leancremental"
+
+[[lean_lib]]
+name = "TestsSupport"
+roots = ["Tests.Util", "Tests.Core", "Tests.Query", "Tests.Pure", "Tests.TutorialExamples", "Tests.Actions", "Tests.ConceptsExamples", "Tests.CookbookExamples", "Tests.Parallel", "Tests.ConcurrencyExamples", "Tests.QueriesExamples", "Tests.FederationExamples"]
+
+[[lean_exe]]
+name = "tests"
+root = "Tests"
+
+[[lean_exe]]
+name = "proptests"
+root = "Tests.Prop"
+
+[[lean_exe]]
+name = "benchScaling"
+root = "Tests.BenchSize"
+
+[[lean_exe]]
+name = "benchScaling2"
+root = "Tests.BenchPropagation"
+
+[[lean_exe]]
+name = "benchScaling3"
+root = "Tests.BenchAggregate"
