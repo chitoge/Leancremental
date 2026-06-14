@@ -519,7 +519,7 @@ def testMarkStalePreservesCachedValue : IO Unit := do
   State.stabilize state
   assertEq "markStale setup value" (← Observer.value! observer) 11
   Incr.markStale y
-  assertEq "markStale preserves cached value" (← Incr.value? y) (some 11)
+  assertEq "markStale preserves cached value" (← Incr.staleValue? y) (some 11)
   assertEq "markStale marks node stale" (← Incr.isStale y) true
   State.stabilize state
   assertEq "markStale recomputes without changing value" (← Observer.value! observer) 11

@@ -320,6 +320,70 @@ Lesson:
   `ToJson` and `FromJson` instances; for file-backed persistence, swap
   `MemoSnapshotStore.hashMap` for `MemoSnapshotStore.fileBacked`
 
+## 10. Stop Unnecessary Propagation With A Cutoff
+
+Problem:
+
+- a derived node recomputes to the same value as before, but its parents still
+  re-fire because the runtime does not know the value is unchanged
+
+```lean
+def cutoffStop : IO (Nat × Nat) := do
+  let state <- State.create
+  let x <- Var.create state 1
+  -- Without a cutoff, setting x to the same value still propagates downstream.
+  -- Cutoff.ofEq stops propagation when the output equals the previous output.
+  let doubled <- map (Var.watch x) (fun n => n * 2) Cutoff.ofEq
+  let obs <- observe doubled
+  State.stabilize state
+  let before <- Observer.value! obs
+  Var.set x 1      -- same value
+  State.stabilize state
+  let after <- Observer.value! obs
+  pure (before, after)
+```
+
+Result:
+
+- both values are `2`; downstream nodes do not refire because `Cutoff.ofEq` detected the equality
+
+Lesson:
+
+- the default [`Cutoff.never`](https://chitoge.github.io/Leancremental/Leancremental/Core/Types.html#Leancremental.Cutoff.never) propagates on every recompute, even when the value is unchanged
+- [`Cutoff.ofEq`](https://chitoge.github.io/Leancremental/Leancremental/Core/Types.html#Leancremental.Cutoff.ofEq) works for any type with a `BEq` instance and is the right default for most derived nodes
+- [`Cutoff.ofHash`](https://chitoge.github.io/Leancremental/Leancremental/Core/Types.html#Leancremental.Cutoff.ofHash) adds a hash pre-check for larger data where equality is expensive
+- set the cutoff at node construction; use [`Incr.setCutoff`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.Incr.setCutoff) to reconfigure later
+
+## Recipe 11 — Safe Federation Stabilize-and-Advance
+
+**Goal**: advance a `FederatedState`'s frontier after stabilization without
+racing against a concurrent `State.stabilize` on the same `localState`.
+
+```lean
+-- Capture the epoch atomically with the stabilization pass.
+let stats ← State.stabilizeWithStats fs.localState
+-- Pass it explicitly so no concurrent stabilize can change it under us.
+let newFrontier ← fs.advanceFrontierAt stats.stabilization
+```
+
+`State.stabilizeWithStats` returns
+[`StabilizeStats`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.StabilizeStats)
+whose `.stabilization` is captured inside `stabilizeLocked`, before the write
+lock is released — the earliest safe read point. Passing it to
+[`FederatedState.advanceFrontierAt`](https://chitoge.github.io/Leancremental/Leancremental/Core/Federation.html#Leancremental.FederatedState.advanceFrontierAt)
+eliminates the window where a racing thread's `stabilize` could increment the
+epoch counter before `advanceFrontier` reads it.
+
+**When `advanceFrontier` is fine**: when `localState` is driven by exactly one
+caller (the common single-agent case). The race only materialises when two
+threads call `State.stabilize` on the same `localState` between a pass
+completing and the subsequent frontier read.
+
+**Related**: for assembling a cluster-wide frontier from multiple agents' epochs
+without antichain loss, use
+[`FederatedState.globalFrontier`](https://chitoge.github.io/Leancremental/Leancremental/Core/Federation.html#Leancremental.FederatedState.globalFrontier)
+(see [`Proof.Federation.globalFrontier_covers_iff`](https://chitoge.github.io/Leancremental/Leancremental/Proof/Federation.html#Leancremental.Proof.Federation.globalFrontier_covers_iff)).
+
 ## When To Read The Tutorial
 
 Use this cookbook when you want a quick pattern.
@@ -329,3 +393,7 @@ Use [TUTORIAL.md](TUTORIAL.md) when you want:
 - the bigger mental model
 - more explanation of `necessary`, `Cutoff`, and `bind`
 - the advanced query and proof APIs
+
+Use [CONCURRENCY.md](CONCURRENCY.md) only if you plan to call `State.stabilize` with `parallel := true`.
+
+Use [FEDERATION.md](FEDERATION.md) only if you are coordinating multiple `State` instances across agents or processes.

@@ -6,6 +6,10 @@ import Leancremental.Proof.PureShape
 import Leancremental.Proof.Query
 import Leancremental.Proof.Memo
 import Leancremental.Proof.Scheduler
+import Leancremental.Proof.Parallel
+import Leancremental.Proof.Timestamp
+import Leancremental.Proof.Frontier
+import Leancremental.Proof.Federation
 
 /-! Basic proof lemmas for the executable Leancremental API. -/
 

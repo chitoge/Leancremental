@@ -11,7 +11,7 @@ namespace State
 /-- Lightweight telemetry from one completed stabilization. -/
 structure StabilizeStats where
   /-- Stabilization number assigned to the completed pass. -/
-  stabilization : Nat
+  stabilization : StabilizationId
   /-- Number of node metadata records touched during this stabilization. -/
   nodesStabilized : Nat
   /-- Number of nodes whose value changed during this stabilization. -/
@@ -36,8 +36,12 @@ structure StabilizeBudgetResult where
   rootsProcessed : Nat
 deriving Repr, BEq
 
-/-- Create a fresh independent incremental graph state. -/
-def create : IO State := do
+private initialize stateIdCounter : IO.Ref Nat ← IO.mkRef 0
+
+/-- Create a fresh independent incremental graph state with timestamp type `T`.
+    Use `State.create` for the default `T = Nat` case. -/
+def createWith [Timestamp T] : IO (State T) := do
+  let stateId ← stateIdCounter.modifyGet (fun n => (n, n + 1))
   let nodes <- IO.mkRef #[]
   let nodeGenerations <- IO.mkRef #[]
   let recycledNodeIdsRef <- IO.mkRef #[]
@@ -58,7 +62,8 @@ def create : IO State := do
   let traceEventsStartRef <- IO.mkRef 0
   let deferredMutationsRef <- IO.mkRef #[]
   let visitStack <- IO.mkRef #[]
-  let stabilizationNum <- IO.mkRef 0
+  let frontierRef <- IO.mkRef (Frontier.advance { elements := #[] } Timestamp.zero)
+  let stabilizationNum <- IO.mkRef (Timestamp.zero)
   let partialStabilization <- IO.mkRef none
   let stabilizing <- IO.mkRef false
   let handlerFailureModeRef <- IO.mkRef HandlerFailureMode.traceOnly
@@ -72,6 +77,7 @@ def create : IO State := do
   let lastPassTimingsRef <- IO.mkRef (Array.empty : Array (Nat × Nat))
   let stateLock <- Std.BaseSharedMutex.new
   pure {
+    stateId := stateId,
     nodes := nodes,
     nodeGenerations := nodeGenerations,
     recycledNodeIdsRef := recycledNodeIdsRef,
@@ -92,6 +98,7 @@ def create : IO State := do
     traceEventsStartRef := traceEventsStartRef,
     deferredMutationsRef := deferredMutationsRef,
     visitStack := visitStack,
+    frontierRef := frontierRef,
     stabilizationNum := stabilizationNum,
     partialStabilization := partialStabilization,
     stabilizing := stabilizing,
@@ -106,6 +113,9 @@ def create : IO State := do
     lastPassTimingsRef := lastPassTimingsRef,
     stateLock := stateLock
   }
+
+/-- Create a fresh independent incremental graph state with the default `Nat` timestamp. -/
+def create : IO State := createWith
 
 /-- Return scheduler-facing trace events emitted so far. -/
 def traceEvents (state : State) : IO (Array StateTraceEvent) :=
@@ -159,7 +169,7 @@ def lastPassTimings (state : State) : IO (Array (Nat × Nat)) :=
   state.lastPassTimingsRef.get
 
 /-- Return the most recent completed stabilization number. -/
-def currentStabilization (state : State) : IO Nat :=
+def currentStabilization (state : State) : IO StabilizationId :=
   state.stabilizationNum.get
 
 /-- Return whether a budgeted stabilization has remaining work. -/
@@ -336,6 +346,22 @@ def numObservers (state : State) : IO Nat := do
       count := count + 1
   pure count
 
+/-- Return whether the current graph is made only of node kinds that participate
+    in parallel stabilization.
+
+    This is a pre-flight check for `parallel := true`. If it returns `false`,
+    the graph still works, but some nodes will run sequentially.
+
+    Non-parallel-safe kinds: `bind`, `freeze`, `expert`, `join`, `branch`.
+    Cost: O(all nodes). -/
+def graphParallelSafe (state : State) : IO Bool := do
+  let nodes ← state.nodes.get
+  for index in [:nodes.size] do
+    let info ← Internal.State.getInfo state index
+    if !info.kind.isParallelSafe then
+      return false
+  return true
+
 def reachableNodeIds (state : State) : IO (Array Nat) :=
   Internal.State.collectNecessary state
 
@@ -447,23 +473,44 @@ private def refreshObserversLocked (state : State) : IO (Array (IO Unit)) := do
   pure pendingCallbacks
 
 -- Inner stabilization logic. Caller must hold the write lock.
-private def stabilizeLocked (state : State) : IO (Array (IO Unit)) := do
+-- `parallel`: when true, uses the barrier-per-height parallel drain instead of the
+-- sequential drain.  The global write lock is still held for the full duration.
+-- Returns the completed stabilization epoch together with the observer callbacks.
+private def stabilizeLocked (state : State) (parallel : Bool) :
+    IO (StabilizationId × Array (IO Unit)) := do
   if <- state.stabilizing.get then
     Internal.throwUser "nested stabilization is not supported"
   state.stabilizing.set true
   try
     let stabilization <- startOrResumeStabilization state
-    Internal.State.drainRecomputeHeap state stabilization
+    if parallel then
+      Internal.State.drainRecomputeHeapParallel state stabilization
+    else
+      Internal.State.drainRecomputeHeap state stabilization
     -- Deferred mutations are applied before observer refresh so that observers
     -- see the final graph state (including any staleness set by deferred ops).
     state.stabilizing.set false
     Internal.State.applyDeferredMutations state stabilization
+    -- Advance the frontier to the completed stabilization epoch.
+    let oldFrontier <- state.frontierRef.get
+    state.frontierRef.set (Frontier.advance oldFrontier stabilization)
     let callbacks <- refreshObserversLocked state
     state.partialStabilization.set none
-    pure callbacks
+    pure (stabilization, callbacks)
   catch error =>
     state.stabilizing.set false
     throw error
+
+-- Acquire the write lock, run stabilization, release the lock, fire callbacks.
+-- Returns the epoch that was captured inside the lock — before any concurrent
+-- `stabilize` call on the same state could increment it.
+private def stabilizeInner (state : State) (parallel : Bool) : IO StabilizationId := do
+  state.stateLock.write
+  let (stabilization, pendingCallbacks) ←
+    try stabilizeLocked state parallel finally state.stateLock.unlockWrite
+  for callback in pendingCallbacks do
+    callback
+  pure stabilization
 
 /--
 Bring all active observers up to date by recomputing necessary stale nodes.
@@ -471,17 +518,27 @@ Bring all active observers up to date by recomputing necessary stale nodes.
 Variable changes and clock advances become visible to observers only after this
 function completes successfully.
 
-Thread-safety: serialized through the state's write lock; nested stabilization
-is rejected.
+When `parallel := true`, nodes at the same height level are recomputed concurrently
+using `IO.asTask`.  Only `const`, `var`, `map`, `map2`, `map3`, `map4`, `map5`,
+and `fold` nodes participate in parallel execution; `bind`, `freeze`, and `expert`
+nodes always run sequentially.
 
-Cost: depends on how many necessary stale nodes must be recomputed.
+For ordinary use, this mainly means that pure `map`-style computations can run
+in parallel. `Expert.Node` remains sequential. If you build custom runtime
+behavior around shared mutable state, that state still needs the usual explicit
+synchronization.
+
+Thread-safety: `stabilize` itself is serialized through the state's write lock;
+nested stabilization is rejected.
+
+Cost: depends on how many necessary stale nodes must be recomputed and how many
+can be parallelized.
+
+Call `State.graphParallelSafe` before passing `parallel := true` to confirm
+that no node in the graph will fall back to sequential execution.
 -/
-def stabilize (state : State) : IO Unit := do
-  state.stateLock.write
-  let pendingCallbacks <- try stabilizeLocked state finally state.stateLock.unlockWrite
-  -- Fire callbacks outside the lock so they can freely call Observer.value, Var.set, etc.
-  for callback in pendingCallbacks do
-    callback
+def stabilize (state : State) (parallel : Bool := false) : IO Unit := do
+  let _ ← stabilizeInner state parallel
 
 /-- Return stabilization telemetry for the current metadata state. Cost: O(all nodes + all observers). -/
 def stabilizationStats (state : State) (stabilization : Nat) : IO StabilizeStats := do
@@ -523,11 +580,15 @@ def lastPassCounters (state : State) : IO (Nat × Nat) := do
 /--
 Stabilize the graph and return lightweight telemetry for the completed pass.
 
+Accepts the same `parallel` parameter as `stabilize`.
+
 Cost: stabilization cost plus `stabilizationStats`, which scans current state.
 -/
-def stabilizeWithStats (state : State) : IO StabilizeStats := do
-  stabilize state
-  let stabilization <- currentStabilization state
+def stabilizeWithStats (state : State) (parallel : Bool := false) : IO StabilizeStats := do
+  -- Use stabilizeInner to get the epoch captured inside the write lock, avoiding
+  -- the race where a concurrent stabilize could increment the counter before
+  -- currentStabilization reads it.
+  let stabilization ← stabilizeInner state parallel
   stabilizationStats state stabilization
 
 -- Inner budget stabilization logic. Caller must hold the write lock.
@@ -546,6 +607,8 @@ private def stabilizeWithBudgetLocked
       -- see the final graph state after the completed stabilization pass.
       state.stabilizing.set false
       Internal.State.applyDeferredMutations state stabilization
+      let oldFrontier <- state.frontierRef.get
+      state.frontierRef.set (Frontier.advance oldFrontier stabilization)
       let callbacks <- refreshObserversLocked state
       state.partialStabilization.set none
       let stats <- stabilizationStats state stabilization

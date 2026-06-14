@@ -27,21 +27,32 @@ def clearValueRef (valueRef : IO.Ref (Option α)) : IO Bool := do
       valueRef.set none
       pure true
 
-/-- Return the currently cached value, if this node has one. -/
+/--
+Return `some v` only if this node has a computed, non-stale value; return `none`
+if the node has never been computed or if it is currently stale (i.e., a
+`Var.set` on an ancestor has not yet been stabilized).
+
+To read the last cached value regardless of staleness — for example, to show a
+previous result while a new stabilization is pending — use `staleValue?`.
+-/
 def value? (node : Incr α) : IO (Option α) := do
   ensureCurrent node
-  node.valueRef.get
+  let info ← Internal.State.getInfo node.state node.id
+  if info.stale then pure none
+  else node.valueRef.get
 
 /--
-Return the cached value even if the node is currently marked stale.
+Return the last cached value for this node even if it is currently stale.
 
-This is an explicit alias for latency-sensitive clients, such as editor tooling,
-that want to show a last-known value while a newer stabilization is pending.
+Returns `none` only if the node has never been computed. Use this when you
+intentionally want the previous result while a newer stabilization is pending
+(e.g., latency-sensitive UI that shows stale-while-revalidating fallbacks).
+For a guarantee that the value is fresh, use `value?` or call `State.stabilize`
+first.
 -/
-def staleValue? (node : Incr α) : IO (Option α) :=
-  do
-    ensureCurrent node
-    node.valueRef.get
+def staleValue? (node : Incr α) : IO (Option α) := do
+  ensureCurrent node
+  node.valueRef.get
 
 /-- Return the currently cached value or an explanatory error string. -/
 def value (node : Incr α) : IO (Except String α) := do
@@ -166,7 +177,14 @@ def invalidate (node : Incr α) : IO Unit := do
 
 end Incr
 
-/-- Create an incremental constant whose value never changes. -/
+/--
+Create an incremental constant whose value never changes.
+
+**Cutoff default**: the `cutoff` parameter defaults to `Cutoff.never`, which
+propagates on every recompute even when the value is unchanged. For a true
+constant this rarely matters, but the parameter is available for consistency
+with the other node constructors.
+-/
 def const (state : State) (value : α) (cutoff : Cutoff α := Cutoff.never) : IO (Incr α) := do
   let valueRef <- IO.mkRef (some value)
   let cutoffRef <- IO.mkRef cutoff
@@ -185,6 +203,11 @@ namespace Var
 
 /--
 Create a mutable input variable in `state`.
+
+**Cutoff default**: the `cutoff` parameter defaults to `Cutoff.never`, which
+propagates downstream on every stabilization after `Var.set`, even when the new
+value equals the old one. Pass `Cutoff.ofEq` or `Cutoff.ofHash` to stop
+unnecessary downstream recomputation when inputs are set to the same value.
 
 Cost: O(1) allocation plus node registration.
 
@@ -243,11 +266,13 @@ def replace (var : Var α) (f : α -> α) : IO Unit := do
     var.state.stateLock.unlockWrite
 
 /--
-Return the latest value set on the variable.
+Return the latest value written to this variable.
 
-This reads the variable directly, not the stabilized graph value. If you need a
-value that is consistent with the most recent completed `State.stabilize`, read
-through an observer instead.
+**Clock difference**: this reads the write-side input, not the stabilized graph
+value. After `Var.set x v` but before `State.stabilize`, `Var.value x` returns
+`v` while any observer downstream of `x` still shows the previous stabilized
+value. Read through an observer to get a value consistent with the last
+completed `State.stabilize`.
 
 This call intentionally does not take the state's read lock, because that would
 deadlock inside some expert-node recomputations.
@@ -262,6 +287,10 @@ Build a derived node by applying `f` to one incremental input.
 
 Cost: O(1) node allocation. Recompute cost is the cost of reading the input and
 running `f`.
+
+**Cutoff default**: `Cutoff.never` propagates on every recompute even when the
+output value is unchanged. Pass `Cutoff.ofEq` for types with `BEq`, or
+`Cutoff.ofHash` for larger types, to stop unnecessary downstream work.
 -/
 def map (node : Incr α) (f : α -> β) (cutoff : Cutoff β := Cutoff.never) : IO (Incr β) := do
   Incr.ensureCurrent node
@@ -279,12 +308,19 @@ def map (node : Incr α) (f : α -> β) (cutoff : Cutoff β := Cutoff.never) : I
 /--
 Build a derived node by applying `f` to two incremental inputs.
 
+All inputs must belong to the same `State`; mixing nodes from different states
+is detected at construction time and raises `IO.userError`.
+
 Cost: O(1) node allocation. Recompute cost is the cost of reading both inputs
 and running `f`.
+
+**Cutoff default**: `Cutoff.never` propagates on every recompute even when the
+output value is unchanged. See `map` for details.
 -/
 def map2 (left : Incr α) (right : Incr β) (f : α -> β -> γ) (cutoff : Cutoff γ := Cutoff.never) : IO (Incr γ) := do
   Incr.ensureCurrent left
   Incr.ensureCurrent right
+  Internal.State.requireSameState left.state right.state "map2"
   let valueRef <- IO.mkRef none
   let cutoffRef <- IO.mkRef cutoff
   let digestRef <- IO.mkRef (none : Option UInt64)
@@ -300,13 +336,21 @@ def map2 (left : Incr α) (right : Incr β) (f : α -> β -> γ) (cutoff : Cutof
 /--
 Build a derived node by applying `f` to three incremental inputs.
 
+All inputs must belong to the same `State`; mixing nodes from different states
+is detected at construction time and raises `IO.userError`.
+
 Cost: O(1) node allocation. Recompute cost is the cost of reading the inputs
 and running `f`.
+
+**Cutoff default**: `Cutoff.never` propagates on every recompute even when the
+output value is unchanged. See `map` for details.
 -/
 def map3 (first : Incr α) (second : Incr β) (third : Incr γ) (f : α -> β -> γ -> δ) (cutoff : Cutoff δ := Cutoff.never) : IO (Incr δ) := do
   Incr.ensureCurrent first
   Incr.ensureCurrent second
   Incr.ensureCurrent third
+  Internal.State.requireSameState first.state second.state "map3"
+  Internal.State.requireSameState first.state third.state "map3"
   let valueRef <- IO.mkRef none
   let cutoffRef <- IO.mkRef cutoff
   let digestRef <- IO.mkRef (none : Option UInt64)
@@ -323,8 +367,14 @@ def map3 (first : Incr α) (second : Incr β) (third : Incr γ) (f : α -> β ->
 /--
 Build a derived node by applying `f` to four incremental inputs.
 
+All inputs must belong to the same `State`; mixing nodes from different states
+is detected at construction time and raises `IO.userError`.
+
 Cost: O(1) node allocation. Recompute cost is the cost of reading the inputs
 and running `f`.
+
+**Cutoff default**: `Cutoff.never` propagates on every recompute even when the
+output value is unchanged. See `map` for details.
 -/
 def map4
     (first : Incr α)
@@ -337,6 +387,9 @@ def map4
   Incr.ensureCurrent second
   Incr.ensureCurrent third
   Incr.ensureCurrent fourth
+  Internal.State.requireSameState first.state second.state "map4"
+  Internal.State.requireSameState first.state third.state "map4"
+  Internal.State.requireSameState first.state fourth.state "map4"
   let valueRef <- IO.mkRef none
   let cutoffRef <- IO.mkRef cutoff
   let digestRef <- IO.mkRef (none : Option UInt64)
@@ -354,8 +407,14 @@ def map4
 /--
 Build a derived node by applying `f` to five incremental inputs.
 
+All inputs must belong to the same `State`; mixing nodes from different states
+is detected at construction time and raises `IO.userError`.
+
 Cost: O(1) node allocation. Recompute cost is the cost of reading the inputs
 and running `f`.
+
+**Cutoff default**: `Cutoff.never` propagates on every recompute even when the
+output value is unchanged. See `map` for details.
 -/
 def map5
     (first : Incr α)
@@ -370,6 +429,10 @@ def map5
   Incr.ensureCurrent third
   Incr.ensureCurrent fourth
   Incr.ensureCurrent fifth
+  Internal.State.requireSameState first.state second.state "map5"
+  Internal.State.requireSameState first.state third.state "map5"
+  Internal.State.requireSameState first.state fourth.state "map5"
+  Internal.State.requireSameState first.state fifth.state "map5"
   let valueRef <- IO.mkRef none
   let cutoffRef <- IO.mkRef cutoff
   let digestRef <- IO.mkRef (none : Option UInt64)
@@ -395,10 +458,14 @@ is observed.
 
 Use this when the output should depend on `dependency` for scheduling or
 liveness reasons even though its value is not used directly.
+
+**Cross-state**: `node` and `dependency` must belong to the same `State`.
+Passing nodes from different states raises `IO.userError` at construction time.
 -/
 def dependOn (node : Incr α) (dependency : Incr β) : IO (Incr α) := do
   Incr.ensureCurrent node
   Incr.ensureCurrent dependency
+  Internal.State.requireSameState node.state dependency.state "dependOn"
   let valueRef <- IO.mkRef none
   let cutoffRef <- IO.mkRef Cutoff.never
   let digestRef <- IO.mkRef (none : Option UInt64)
@@ -417,11 +484,18 @@ Fold an array of incremental inputs into one incremental result.
 This is a simple full recompute fold: if any input changes, the whole fold is
 recomputed on the next stabilization.
 
+All nodes must belong to `state`; mixing nodes from different states is detected
+at construction time and raises `IO.userError`.
+
 Cost: O(n) in the number of input nodes for each recomputation.
+
+**Cutoff default**: `Cutoff.never` propagates on every recompute even when the
+output value is unchanged. See `map` for details.
 -/
 def arrayFold (state : State) (nodes : Array (Incr α)) (init : β) (f : β -> α -> β) : IO (Incr β) := do
   for node in nodes do
     Incr.ensureCurrent node
+    Internal.State.requireSameState state node.state "arrayFold"
   let valueRef <- IO.mkRef none
   let cutoffRef <- IO.mkRef Cutoff.never
   let digestRef <- IO.mkRef (none : Option UInt64)
@@ -464,6 +538,9 @@ def sumFloat (state : State) (nodes : Array (Incr Float)) : IO (Incr Float) :=
 /--
 Capture the first computed value of `node` and then stop following later
 changes.
+
+**Cutoff default**: `Cutoff.never` propagates on every recompute even when the
+output value is unchanged. See `map` for details.
 -/
 def freeze (node : Incr α) (cutoff : Cutoff α := Cutoff.never) : IO (Incr α) := do
   Incr.ensureCurrent node
@@ -493,10 +570,17 @@ def freeze (node : Incr α) (cutoff : Cutoff α := Cutoff.never) : IO (Incr α) 
 /--
 Follow `node` until `trigger` becomes true, then keep the value seen at that
 stabilization.
+
+`node` and `trigger` must belong to the same `State`; mixing nodes from
+different states is detected at construction time and raises `IO.userError`.
+
+**Cutoff default**: `Cutoff.never` propagates on every recompute even when the
+output value is unchanged. See `map` for details.
 -/
 def freezeWhen (node : Incr α) (trigger : Incr Bool) (cutoff : Cutoff α := Cutoff.never) : IO (Incr α) := do
   Incr.ensureCurrent node
   Incr.ensureCurrent trigger
+  Internal.State.requireSameState node.state trigger.state "freezeWhen"
   let valueRef <- IO.mkRef none
   let cutoffRef <- IO.mkRef cutoff
   let digestRef <- IO.mkRef (none : Option UInt64)
@@ -531,8 +615,19 @@ returned child graph.
 
 This is the main combinator for dynamic graph structure.
 
+**Node accumulation**: each rewire calls `f` and creates a new child subgraph.
+The previous child nodes are abandoned but not freed automatically. Call
+`State.reclaimUnreachableNodes` periodically in long-running programs that
+rewire `bind` frequently to prevent unbounded node growth.
+
+**Cross-state**: `f` must return a node from the same `State` as `node`. A
+cross-state return is detected at recompute time and raises `IO.userError`.
+
 Cost: O(1) node allocation up front. During stabilization it may trigger extra
 work to rewire dependencies before the final value is refreshed.
+
+**Cutoff default**: `Cutoff.never` propagates on every recompute even when the
+output value is unchanged. See `map` for details.
 -/
 def bind (node : Incr α) (f : α -> IO (Incr β)) (cutoff : Cutoff β := Cutoff.never) : IO (Incr β) := do
   Incr.ensureCurrent node
@@ -562,6 +657,7 @@ def bind (node : Incr α) (f : α -> IO (Incr β)) (cutoff : Cutoff β := Cutoff
       let value <- Incr.value! node
       let newChild <- f value
       Incr.ensureCurrent newChild
+      Internal.State.requireSameState node.state newChild.state "bind"
       currentChild.set (some newChild)
       rewiredAtRef.set (some stabilization)
       pendingRewireRef.set true

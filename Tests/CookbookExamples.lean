@@ -137,6 +137,18 @@ def memoCodecRoundtrip : IO (Option String) := do
   State.stabilize state2
   Observer.value? obs2
 
+def cutoffStop : IO (Nat × Nat) := do
+  let state <- State.create
+  let x <- Var.create state 1
+  let doubled <- map (Var.watch x) (fun n => n * 2) Cutoff.ofEq
+  let obs <- observe doubled
+  State.stabilize state
+  let before <- Observer.value! obs
+  Var.set x 1
+  State.stabilize state
+  let after <- Observer.value! obs
+  pure (before, after)
+
 def runAll : IO Unit := do
   assertEq "cookbook sumTwo" (← sumTwo) 35
   assertEq "cookbook readAfterStabilize" (← readAfterStabilize) (2, 20)
@@ -149,6 +161,7 @@ def runAll : IO Unit := do
   assertEq "cookbook memoInvalidate" (← memoInvalidate) (2, true, 1)
   assertEq "cookbook memoScopeClear" (← memoScopeClear) (3, 2, 1)
   assertEq "cookbook memoCodecRoundtrip" (← memoCodecRoundtrip) (some "hello")
+  assertEq "cookbook cutoffStop" (← cutoffStop) (2, 2)
 
 end CookbookExamples
 end Tests

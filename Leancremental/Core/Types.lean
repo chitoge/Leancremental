@@ -11,6 +11,156 @@ implementers.
 
 namespace Leancremental
 
+/-- Opaque alias for the local stabilization counter.
+    In ordinary use this is just `Nat`. -/
+abbrev StabilizationId := Nat
+
+/--
+A timestamp type for incremental progress.
+
+A `Timestamp T` instance says that values of type `T` can be used to talk about
+which stabilization steps are earlier or later. Most users only encounter the
+default `Nat` instance. Advanced distributed code may use vector-style timestamps.
+-/
+class Timestamp (T : Type) where
+  /-- The initial (zero) timestamp. -/
+  zero : T
+  /-- The next timestamp after `t`. -/
+  succ : T → T
+  /-- Partial order: `le a b` iff `a` is no later than `b`. -/
+  le : T → T → Bool
+  /-- Reflexivity: every timestamp is ≤ itself. -/
+  le_refl : ∀ t : T, le t t = true
+  /-- Antisymmetry: if `le a b` and `le b a` then `a = b`. -/
+  le_antisymm : ∀ a b : T, le a b = true → le b a = true → a = b
+  /-- Transitivity: `le` is transitive. -/
+  le_trans : ∀ a b c : T, le a b = true → le b c = true → le a c = true
+  /-- `zero` is the minimum element. -/
+  zero_le : ∀ t : T, le zero t = true
+
+/--
+A lattice timestamp extends `Timestamp` with a join operation.
+
+`join a b` returns one timestamp that is at least as new as both `a` and `b`.
+This matters mainly for advanced coordination code such as federation.
+-/
+class LatticeTimestamp (T : Type) extends Timestamp T where
+  /-- Least upper bound of two timestamps. -/
+  join : T → T → T
+  /-- `join a b ≥ a`. -/
+  join_ge_left : ∀ a b : T, le a (join a b) = true
+  /-- `join a b ≥ b`. -/
+  join_ge_right : ∀ a b : T, le b (join a b) = true
+  /-- `join` is the *least* upper bound. -/
+  join_le : ∀ a b c : T, le a c = true → le b c = true → le (join a b) c = true
+
+/-- `Nat` is a `Timestamp` via its natural order (`Nat.ble`). -/
+instance : Timestamp Nat where
+  zero := 0
+  succ := Nat.succ
+  le a b := Nat.ble a b
+  le_refl t := Nat.ble_eq_true_of_le (Nat.le_refl t)
+  le_antisymm a b hab hba := by
+    exact Nat.le_antisymm (Nat.le_of_ble_eq_true hab) (Nat.le_of_ble_eq_true hba)
+  le_trans a b c hab hbc := by
+    exact Nat.ble_eq_true_of_le (Nat.le_trans (Nat.le_of_ble_eq_true hab) (Nat.le_of_ble_eq_true hbc))
+  zero_le t := Nat.ble_eq_true_of_le (Nat.zero_le t)
+
+/-- `Nat` is a `LatticeTimestamp` via `max`. -/
+instance : LatticeTimestamp Nat where
+  join := Nat.max
+  join_ge_left a b := Nat.ble_eq_true_of_le (Nat.le_max_left a b)
+  join_ge_right a b := Nat.ble_eq_true_of_le (Nat.le_max_right a b)
+  join_le _a _b _c hac hbc :=
+    Nat.ble_eq_true_of_le (Nat.max_le.mpr
+      ⟨Nat.le_of_ble_eq_true hac, Nat.le_of_ble_eq_true hbc⟩)
+
+/--
+A per-agent progress vector with `n` components.
+
+Use this only for federation-style coordination. For ordinary single-state use,
+you can ignore it. Different agents' vectors may be incomparable because one
+agent can be ahead on one slot while another is ahead on a different slot.
+-/
+abbrev VecTimestamp (n : Nat) := Fin n → Nat
+
+private def vecDecideLe (n : Nat) (a b : VecTimestamp n) : Bool :=
+  decide (∀ i : Fin n, a i ≤ b i)
+
+private theorem vecDecideLe_iff (n : Nat) (a b : VecTimestamp n) :
+    vecDecideLe n a b = true ↔ ∀ i : Fin n, a i ≤ b i := by
+  unfold vecDecideLe
+  constructor
+  · intro h; exact of_decide_eq_true h
+  · intro h; exact decide_eq_true h
+
+instance (n : Nat) : Timestamp (VecTimestamp n) where
+  zero := fun _ => 0
+  succ t := fun i => t i + 1
+  le := vecDecideLe n
+  le_refl t :=
+    (vecDecideLe_iff n t t).mpr (fun _ => Nat.le_refl _)
+  le_antisymm a b hab hba :=
+    funext fun i => Nat.le_antisymm
+      ((vecDecideLe_iff n a b).mp hab i)
+      ((vecDecideLe_iff n b a).mp hba i)
+  le_trans a b c hab hbc :=
+    (vecDecideLe_iff n a c).mpr fun i =>
+      Nat.le_trans ((vecDecideLe_iff n a b).mp hab i) ((vecDecideLe_iff n b c).mp hbc i)
+  zero_le t :=
+    (vecDecideLe_iff n (fun _ => 0) t).mpr (fun _ => Nat.zero_le _)
+
+instance (n : Nat) : LatticeTimestamp (VecTimestamp n) where
+  join a b := fun i => Nat.max (a i) (b i)
+  join_ge_left a b :=
+    (vecDecideLe_iff n a (fun i => Nat.max (a i) (b i))).mpr
+      (fun _ => Nat.le_max_left _ _)
+  join_ge_right a b :=
+    (vecDecideLe_iff n b (fun i => Nat.max (a i) (b i))).mpr
+      (fun _ => Nat.le_max_right _ _)
+  join_le _a _b _c hac hbc :=
+    (vecDecideLe_iff n _ _).mpr fun i =>
+      Nat.max_le.mpr
+        ⟨(vecDecideLe_iff n _ _).mp hac i, (vecDecideLe_iff n _ _).mp hbc i⟩
+
+/--
+A set of timestamps where no element is already covered by another one.
+
+For ordinary `Nat` timestamps this collapses to a single latest value. For
+vector-style timestamps it can hold several incomparable progress points at once.
+
+**Invariant**: no stored element is already known to be less than or equal to
+another stored element.
+-/
+structure Antichain (T : Type) where
+  /-- Elements of the antichain. For `T = Nat`, always length 1. -/
+  elements : Array T
+  deriving Repr
+
+/-- A frontier summarizes which stabilization timestamps are definitely complete. -/
+abbrev Frontier (T : Type) := Antichain T
+
+namespace Frontier
+
+/-- Return `true` when the frontier says that timestamp `t` is already covered. -/
+def covers [Timestamp T] (fr : Frontier T) (t : T) : Bool :=
+  fr.elements.any (fun e => Timestamp.le t e)
+
+/-- Advance the frontier to include `t`.
+
+    For ordinary `Nat` timestamps, this simply replaces the old frontier with
+    the new completed epoch.
+
+    For vector-style timestamps, repeated `advance` calls are only suitable for
+    one agent's own monotone progress. If you need one frontier that reflects
+    several agents at once, use `FederatedState.globalFrontier` instead. -/
+def advance [Timestamp T] (_fr : Frontier T) (t : T) : Frontier T :=
+  -- For a total order, the max element subsumes all others; replace all.
+  -- For partial orders (Phase 5), a proper antichain insert would be used.
+  { elements := #[t] }
+
+end Frontier
+
 /-- The implementation kind of an incremental node, used for diagnostics and DOT output. -/
 inductive NodeKind where
   | const
@@ -46,6 +196,22 @@ def name : NodeKind -> String
   | .freeze => "freeze"
   | .expert => "expert"
 
+/-- Return `true` when this node kind's recompute function is safe to run
+    concurrently with other same-height nodes in the same stabilization pass.
+
+    A parallel-safe kind writes only to its own `valueRef` and `infoRef` and
+    reads only its children's `valueRef`s, which are read-only at the current
+    height level (guaranteed by the height invariant and the per-level barrier).
+    It never calls `setChildren`, `enqueueRecompute`, or any other operation
+    that modifies shared graph structure.
+
+    `bind` and `freeze` are sequential because their recompute functions call
+    `setChildren`.  `expert` is sequential because its compute function is
+    arbitrary user `IO` with no structure-purity guarantee. -/
+def isParallelSafe : NodeKind → Bool
+  | .const | .var | .map | .map2 | .map3 | .map4 | .map5 | .fold => true
+  | .bind | .freeze | .expert | .join | .branch => false
+
 end NodeKind
 
 /--
@@ -67,7 +233,16 @@ structure Cutoff (α : Type) where
 
 namespace Cutoff
 
-/-- Never cut off propagation; every recomputation is considered a change. -/
+/--
+Never cut off propagation: the recomputed value always propagates downstream,
+even when it is equal to the previous value.
+
+**This is the default `cutoff` argument for every combinator in this library.**
+Use [`Cutoff.ofEq`](https://chitoge.github.io/Leancremental/Leancremental/Core/Types.html#Leancremental.Cutoff.ofEq)
+for types with `BEq`, or
+[`Cutoff.ofHash`](https://chitoge.github.io/Leancremental/Leancremental/Core/Types.html#Leancremental.Cutoff.ofHash)
+when equality is expensive, if unnecessary downstream recomputation is a concern.
+-/
 def never : Cutoff α where
   shouldCutoff := fun _ _ => false
 
@@ -125,7 +300,7 @@ This is mainly useful for debugging, graph export, and external scheduling
 logic. Ordinary library users usually work with `Incr`, `Var`, `Observer`, and
 `State` instead.
 -/
-structure NodeInfo where
+structure NodeInfo (T : Type := Nat) where
   /-- Stable numeric node identifier inside its `State`. -/
   id : Nat
   /-- Implementation kind for this node. -/
@@ -143,13 +318,13 @@ structure NodeInfo where
   /-- Whether this node is currently valid. -/
   valid : Bool
   /-- Stabilization number in which this node was last recomputed. -/
-  computedAt : Option Nat
+  computedAt : Option T
   /-- Stabilization number in which this node's value last changed. -/
-  changedAt : Option Nat
+  changedAt : Option T
   /-- Stabilization number currently visiting this node, if any. -/
-  visitingAt : Option Nat
+  visitingAt : Option T
   /-- Most recent stabilization epoch where this node was explicitly touched by external code. -/
-  lastAccessedAt : Option Nat
+  lastAccessedAt : Option T
   /-- Optional external dirtying reason recorded for scheduler integration. -/
   externalDirtyReason : Option String
   /-- Free-form scheduler tags associated with this node. -/
@@ -211,9 +386,9 @@ inductive TraceMode where
 deriving Repr, BEq
 
 /-- Type-erased node data stored inside `State`. Internal runtime detail. -/
-structure PackedNode where
+structure PackedNode (T : Type := Nat) where
   /-- Mutable diagnostic metadata for this node. -/
-  infoRef : IO.Ref NodeInfo
+  infoRef : IO.Ref (NodeInfo T)
   /-- Registered necessary/unnecessary transition callbacks. -/
   observabilityHandlers : IO.Ref (Array (Bool -> IO Unit))
   /-- Return whether this node currently has a cached value. -/
@@ -223,7 +398,7 @@ structure PackedNode where
   /-- Whether this node can safely recompute after its cache is cleared. -/
   canRecomputeAfterClear : Bool
   /-- Recompute this node for the supplied stabilization number. -/
-  recompute : Nat -> IO Bool
+  recompute : T -> IO Bool
 
 /-- Type-erased observer data stored inside `State`. Internal runtime detail. -/
 structure PackedObserver where
@@ -254,9 +429,11 @@ Most users create a `State` and then interact with it through helper functions
 such as `State.stabilize`, `Var.create`, and `observe`, rather than reading or
 writing these fields directly.
 -/
-structure State where
+structure State (T : Type := Nat) where
+  /-- Unique identity for this incremental world; used by cross-state checks. -/
+  stateId : Nat
   /-- All allocated nodes in this incremental world. -/
-  nodes : IO.Ref (Array PackedNode)
+  nodes : IO.Ref (Array (PackedNode T))
   /-- Generation number for each node slot; increments every time a slot is reclaimed. -/
   nodeGenerations : IO.Ref (Array Nat)
   /-- Recycled node-slot ids available for reuse by future allocations. -/
@@ -285,10 +462,14 @@ structure State where
   deferredMutationsRef : IO.Ref (Array DeferredMutation)
   /-- Current recursion stack used for cycle diagnostics. -/
   visitStack : IO.Ref (Array Nat)
+  /-- Current frontier: the set of stabilization epochs that have been completed.
+      Advanced at the end of each stabilization pass.  For `T = Nat` this is
+      always the singleton `{current_epoch}`. -/
+  frontierRef : IO.Ref (Frontier T)
   /-- Monotone stabilization counter. -/
-  stabilizationNum : IO.Ref Nat
+  stabilizationNum : IO.Ref StabilizationId
   /-- Stabilization number for an incomplete budgeted stabilization, if any. -/
-  partialStabilization : IO.Ref (Option Nat)
+  partialStabilization : IO.Ref (Option StabilizationId)
   /-- Whether `State.stabilize` is currently running. -/
   stabilizing : IO.Ref Bool
   /-- Controls how handler (callback) exceptions are handled during stabilization. -/

@@ -198,8 +198,12 @@ Many nodes store their most recent computed result.
 
 That cached value is what observers read after stabilization.
 
-Some APIs, such as `Incr.staleValue?`, let you look at the old cached value
-while a newer stabilization is still pending.
+[`Incr.value?`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.Incr.value?)
+returns `none` when the node is stale (not yet re-stabilized) as well as when
+it has never been computed. Use
+[`Incr.staleValue?`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.Incr.staleValue?)
+when you intentionally want the old cached value while a newer stabilization is
+still pending.
 
 ### Cutoff
 
@@ -210,7 +214,9 @@ Example:
 - if a node recomputes from `42` to `42`, you often do not want to notify all
   parents again
 
-That is what cutoffs are for.
+That is what cutoffs are for. **The default cutoff is `Cutoff.never`, which
+always propagates — even when the output value is unchanged.** Provide
+`Cutoff.ofEq` or `Cutoff.ofHash` to stop unnecessary downstream work.
 
 Common choices:
 
@@ -326,6 +332,7 @@ Leancremental has internal locks, but the easiest safe mental model is:
 - treat one `State` as one mutable shared object
 - do not assume arbitrary graph construction and mutation are freely parallel
 - perform updates, then stabilize, then read observers
+- all inputs to a combinator (`map2`, `arrayFold`, `bind`, etc.) must belong to the same `State`; mixing nodes from different instances raises `IO.userError`
 
 Observer reads are the main synchronized read path. Direct variable reads such
 as `Var.value` are useful, but they are not the same as "read the last stable
@@ -334,21 +341,26 @@ graph result".
 If you need a value that matches the current stabilized graph state, prefer an
 `Observer`.
 
+If you need parallel stabilization inside one `State`, see [CONCURRENCY.md](CONCURRENCY.md).
+If you need to coordinate multiple independent `State` instances, see [FEDERATION.md](FEDERATION.md).
+
 ## Inside Versus Outside The Graph
 
 These reads are easy to mix up at first.
 
 | What you read | Typical API | What it means |
 | --- | --- | --- |
-| Current mutable input | [`Var.value`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.Var.value) | Read the variable directly, outside the incremental graph. Useful for control logic, but not a synchronized snapshot of the whole stabilized graph. |
+| Current mutable input | [`Var.value`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.Var.value) | Read the variable directly, outside the incremental graph. Returns the write-side value immediately after `Var.set`, before stabilization. Not a synchronized snapshot of the whole stabilized graph. |
 | Last stable observed result | [`Observer.value?`](https://chitoge.github.io/Leancremental/Leancremental/Core/Observer.html#Leancremental.Observer.value?), [`Observer.value!`](https://chitoge.github.io/Leancremental/Leancremental/Core/Observer.html#Leancremental.Observer.value!) | Read what the observed node last computed during stabilization. This is the usual way to get user-visible answers. |
-| Old cached result while newer work is pending | [`Incr.staleValue?`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.Incr.staleValue?) | Read the previous cached value from a stale node before the next stabilization finishes. Useful for stale-result fallbacks. |
+| Fresh non-observed node value | [`Incr.value?`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.Incr.value?) | Returns `some v` only when the node has been computed and is not stale. Returns `none` after `Var.set` on an ancestor (until the next `State.stabilize`). Use `staleValue?` if you want the cached value even while stale. |
+| Old cached result while newer work is pending | [`Incr.staleValue?`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.Incr.staleValue?) | Read the previous cached value from a stale node before the next stabilization finishes. Returns `none` only if the node has never been computed. Useful for stale-result fallbacks. |
 | Current content plus version | [`Document.snapshot`](https://chitoge.github.io/Leancremental/Leancremental/Core/Document.html#Leancremental.Document.snapshot) | Read document state outside the graph when you need to tag work or create a request token. |
 
 Rule of thumb:
 
 - use [`Observer.value!`](https://chitoge.github.io/Leancremental/Leancremental/Core/Observer.html#Leancremental.Observer.value!) for answers you want to show to users
-- use [`Var.value`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.Var.value) for direct mutable state reads
+- use [`Var.value`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.Var.value) for direct mutable state reads — remember it returns the write-side value, not the stabilized graph result
+- use [`Incr.value?`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.Incr.value?) when you want a non-observed node's fresh value (`none` if stale)
 - use [`Incr.staleValue?`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.Incr.staleValue?) only when you intentionally want an old cached answer
 - use [`Document.snapshot`](https://chitoge.github.io/Leancremental/Leancremental/Core/Document.html#Leancremental.Document.snapshot) or [`Document.requestToken`](https://chitoge.github.io/Leancremental/Leancremental/Core/Document.html#Leancremental.Document.requestToken) when coordinating with
   editor-style request lifecycles
@@ -364,9 +376,11 @@ time 1: stabilize
         observer of frozen reads 1
 time 2: set x := 10
         Var.value x reads 10 immediately
-        Incr.staleValue? doubled can still read some 2
+        Incr.value? doubled returns none   -- node is stale; call stabilize first
+        Incr.staleValue? doubled reads some 2  -- explicit bypass: old cached value
         Observer.value! doubled still reads 2 until stabilization
 time 3: stabilize
+        Incr.value? doubled returns some 20  -- node is fresh again
         observer of doubled now reads 20
         observer of frozen still reads 1
 ```
@@ -374,7 +388,8 @@ time 3: stabilize
 The key distinctions are:
 
 - `freeze` keeps the first stabilized value it captured
-- `Incr.staleValue?` can expose the old cached value while a node is stale
+- `Incr.value?` returns `none` whenever the node is stale, signaling "not yet re-stabilized"
+- `Incr.staleValue?` explicitly bypasses that check and returns the old cached value
 - `Observer.value!` shows the last stable observed value, not the newest
   unstabilized input write
 
@@ -442,13 +457,94 @@ You may need a `MemoTable` so repeated requests for the same key reuse one node.
 
 If you used `ifThenElse` or `bind`, only the active branch is necessary.
 
+### "I combined nodes from two different `State` instances."
+
+This is caught at construction time with an `IO.userError`. All inputs to `map2`,
+`arrayFold`, `bind`, and similar combinators must belong to the same `State`. Create
+a single shared `State` and pass it through your graph builders.
+
+### "My `bind` node is keeping too many nodes alive."
+
+Every rewire of a `bind` creates a new child subgraph; old children are not freed
+automatically. Call
+[`State.reclaimUnreachableNodes`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.State.reclaimUnreachableNodes)
+periodically after stabilization when `bind` rewires frequently.
+
+### "Every change re-propagates even when the output value is the same."
+
+The default cutoff is `Cutoff.never`, which always propagates. Pass
+`Cutoff.ofEq` or `Cutoff.ofHash` at node construction to stop unnecessary
+downstream work.
+
+## Federation Terms
+
+Most users can skip this section. It only matters if you are coordinating
+multiple independent `State` instances across agents or processes.
+
+At a high level:
+
+- a `FederatedState n` wraps one local `State` together with a little extra
+  metadata for cross-agent coordination
+- a `VecTimestamp n` records one progress counter per agent
+- a `Frontier` describes which vector timestamps are definitely complete
+
+If you want the full walkthrough, read [FEDERATION.md](FEDERATION.md). The two
+main pitfalls are below:
+
+### Antichain loss in `Frontier.advance`
+
+[`Frontier.advance fr t`](https://chitoge.github.io/Leancremental/Leancremental/Core/Types.html#Leancremental.Frontier.advance)
+replaces the entire frontier with `{ t }`. For a single agent's monotone epoch
+sequence this is correct — each epoch dominates the last. For **incomparable**
+`VecTimestamp` vectors (two different agents' progress, for example), calling
+`advance` twice silently discards the first entry:
+
+```lean
+-- WRONG: vecA is silently discarded
+let fr := Frontier.advance (Frontier.advance fr0 vecA) vecB
+fr.covers pointBelowVecA  -- false
+```
+
+Use [`FederatedState.globalFrontier`](https://chitoge.github.io/Leancremental/Leancremental/Core/Federation.html#Leancremental.FederatedState.globalFrontier)
+to build a frontier from all agents' epochs at once — it stores the pointwise
+join as a single element and never calls `advance` with incomparable vectors.
+See [`Proof.Federation.globalFrontier_covers_iff`](https://chitoge.github.io/Leancremental/Leancremental/Proof/Federation.html#Leancremental.Proof.Federation.globalFrontier_covers_iff)
+for the formal coverage proof.
+
+### Epoch capture race in `advanceFrontier`
+
+[`FederatedState.advanceFrontier`](https://chitoge.github.io/Leancremental/Leancremental/Core/Federation.html#Leancremental.FederatedState.advanceFrontier)
+reads the local epoch via `currentStabilization` *after* `State.stabilize` releases
+its write lock. If a second thread calls `State.stabilize` on the same `localState`
+and completes before `advanceFrontier` reads, the frontier is advanced to the wrong
+(newer) epoch.
+
+The safe alternative uses the epoch captured inside the lock:
+
+```lean
+-- Safe: epoch is captured inside the write lock by stabilizeWithStats
+let stats ← State.stabilizeWithStats fs.localState
+let fr ← fs.advanceFrontierAt stats.stabilization
+```
+
+[`State.stabilizeWithStats`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.State.stabilizeWithStats)
+returns [`StabilizeStats`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.StabilizeStats)
+whose `.stabilization` field holds the epoch captured inside `stabilizeLocked` —
+before any concurrent `stabilize` call could increment it.
+
+If `localState` is driven by a single caller (the typical single-agent case),
+`advanceFrontier` is safe and simpler. Prefer `advanceFrontierAt` whenever
+`localState` is shared across threads.
+
 ## Suggested Reading Order
 
 1. [README.md](README.md)
 2. This file
 3. [COOKBOOK.md](COOKBOOK.md)
 4. [TUTORIAL.md](TUTORIAL.md)
-5. Generated API docs for the modules you actually use
+5. [CONCURRENCY.md](CONCURRENCY.md) only if you want parallel stabilization inside one `State`
+6. [FEDERATION.md](FEDERATION.md) only if you need multi-agent or multi-process coordination
+7. Generated API docs for the modules you actually use
 
 For most users, the first runtime modules to learn are:
 

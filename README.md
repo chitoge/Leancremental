@@ -32,6 +32,11 @@ Recommended reading order:
 `CONCEPTS.md` defines the vocabulary. `COOKBOOK.md` gives small task-oriented
 examples. `TUTORIAL.md` is longer and more explanatory.
 
+Advanced follow-up docs:
+
+- [CONCURRENCY.md](CONCURRENCY.md): parallel stabilization inside one `State`
+- [FEDERATION.md](FEDERATION.md): coordinating multiple independent `State` instances across agents or processes
+
 ## Quick Start
 
 ```lean
@@ -171,7 +176,7 @@ itself may need to change shape.
 ## Thread Safety
 
 Leancremental uses internal locking, but that does not mean every operation is
-intended for free-for-all concurrent use.
+intended for arbitrary concurrent use.
 
 The practical model is:
 
@@ -189,8 +194,11 @@ If you want predictable behavior, use this rule of thumb:
 2. call `State.stabilize`
 3. read results through observers
 
-For fine-grained details, see the docstrings on [`Var.value`](https://chitoge.github.io/Leancremental/Leancremental/Core/Basic.html#Leancremental.Var.value),
-[`State.nodesWithTag`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.State.nodesWithTag), [`State.staleNecessaryIds`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.State.staleNecessaryIds), and [`Expert.Node.create`](https://chitoge.github.io/Leancremental/Leancremental/Core/Expert.html#Leancremental.Expert.Node.create).
+For deeper details, see the API docstrings on `Var.value`, `State.nodesWithTag`, and `State.staleNecessaryIds`.
+
+For intra-stabilization parallelism — running independent graph nodes
+concurrently inside a single pass via `parallel := true` — see
+[CONCURRENCY.md](CONCURRENCY.md).
 
 ## Complexity Notes
 
@@ -256,7 +264,7 @@ The runtime exposes a small diagnostics surface:
 - [`State.detectCycle`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.State.detectCycle) reports cycle paths.
 - [`State.checkInvariants`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.State.checkInvariants) checks basic graph metadata invariants.
 - [`State.checkStableInvariants`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.State.checkStableInvariants) checks stronger post-stabilization invariants.
-- [`State.traceEvents`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.State.traceEvents) exposes structured scheduler-facing trace records.
+- [`State.traceEvents`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.State.traceEvents) exposes low-level runtime trace records for advanced debugging.
 
 ## Proof Surface
 
@@ -266,14 +274,15 @@ Leancremental also includes a pure model for theorem work.
 - [`CoreSnapshot`](https://chitoge.github.io/Leancremental/Leancremental/Core/Snapshot.html#Leancremental.CoreSnapshot) connects pure expressions to executable graphs.
 - [`Leancremental.Proof`](https://chitoge.github.io/Leancremental/Leancremental/Proof.html) collects the current theorem layer.
 
-This proof layer is useful today, but it does not yet prove that the mutable
-`IO.Ref` runtime always implements the pure semantics after stabilization.
+This proof layer is optional. Most users can ignore it unless they are doing theorem work or studying the formal model.
 
 ## Where To Read Next
 
 - [CONCEPTS.md](CONCEPTS.md): plain-language definitions of the main runtime terms
 - [COOKBOOK.md](COOKBOOK.md): small task-oriented examples
 - [TUTORIAL.md](TUTORIAL.md): a worked introduction with executable examples
+- [CONCURRENCY.md](CONCURRENCY.md): parallel stabilization inside one `State`
+- [FEDERATION.md](FEDERATION.md): coordinating multiple independent `State` instances
 - [Leancremental.lean](Leancremental.lean): public umbrella import
 - [Leancremental/Core.lean](Leancremental/Core.lean): runtime API re-export
 - [Leancremental/Pure.lean](Leancremental/Pure.lean): pure model
@@ -291,6 +300,8 @@ Current runtime support includes:
 - cutoffs
 - query memoization
 - budgeted stabilization
+- parallel stabilization (`parallel` parameter on `State.stabilize`)
+- federation helpers for coordinating multiple independent states
 - graph export and invariant checks
 - clocks and expert nodes
 - a proof-oriented pure model

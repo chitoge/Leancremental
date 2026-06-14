@@ -72,6 +72,11 @@ def closeCyclePath (needle : Nat) (stack : Array Nat) : List Nat :=
 def formatCycle (cycle : List Nat) : String :=
   "cycle detected: " ++ joinWith " -> " (cycle.map (fun id => s!"n{id}"))
 
+def State.requireSameState (a b : State) (caller : String) : IO Unit :=
+  if a.stateId != b.stateId then
+    throwUser s!"{caller}: nodes belong to different State instances (stateId {a.stateId} vs {b.stateId}); combinators only accept nodes from one shared State"
+  else pure ()
+
 def State.getNode (state : State) (id : Nat) : IO PackedNode := do
   let nodes <- state.nodes.get
   match nodes[id]? with
@@ -732,6 +737,139 @@ partial def State.drainRecomputeHeapWithBudget (state : State) (stabilization bu
           State.stabilizeOne state stabilization id
         let rest <- State.drainRecomputeHeapWithBudget state stabilization (budget - 1)
         pure (rest + 1)
+
+-- ---------------------------------------------------------------------------
+-- Parallel stabilization helpers
+-- ---------------------------------------------------------------------------
+
+/-- Find the minimum occupied height in the recompute heap, scanning forward from `h`.
+    Updates `nextHeight` as a side effect when a non-empty bucket is found. -/
+private partial def State.findMinOccupiedFrom (state : State) (h : Nat) : IO (Option Nat) := do
+  let buckets ← state.recomputeHeap.buckets.get
+  if h >= buckets.size then return none
+  if !(buckets[h]!.isEmpty) then
+    state.recomputeHeap.nextHeight.set h
+    return some h
+  State.findMinOccupiedFrom state (h + 1)
+
+/-- Pop all entries at height `h` from the recompute heap and return them.
+    Updates `members` and `sizeRef`; `nextHeight` is the caller's responsibility. -/
+private def State.popBucketAtHeight (state : State) (h : Nat) : IO (Array Nat) := do
+  let buckets ← state.recomputeHeap.buckets.get
+  if h >= buckets.size then return #[]
+  let bucket := buckets[h]!
+  if bucket.isEmpty then return #[]
+  state.recomputeHeap.buckets.modify (fun bs => bs.set! h #[])
+  state.recomputeHeap.members.modify (fun m => bucket.foldl (fun acc id => acc.erase id) m)
+  state.recomputeHeap.sizeRef.modify (fun s => s - bucket.size)
+  pure bucket
+
+/-- Recompute a parallel-safe node without touching any shared `State` refs.
+    Precondition: `info.kind.isParallelSafe = true`.
+
+    Only writes to the node's own `infoRef` and `valueRef`.  Never calls
+    `setChildren`, `enqueueRecompute`, `removeStaleNecessaryId`, `appendTraceEvent`,
+    or any other operation that modifies shared graph structure.
+
+    The caller (`drainRecomputeHeapParallel`) handles all shared-state updates
+    (`nodesVisitedRef`, `removeStaleNecessaryId`, `appendTraceEvent`,
+    `changedNodeIdsRef`, `markParentsStale`) in its sequential post-processing
+    phase after the `IO.Task.get` barrier. -/
+def State.stabilizeOneParallelSafe (state : State) (stabilization id : Nat) : IO Bool := do
+  let node ← State.getNode state id
+  let info ← node.infoRef.get
+  let missingValue := !(← node.hasValue)
+  if info.computedAt == some stabilization && !info.stale && !missingValue then
+    return false
+  let changed ←
+    if info.stale || missingValue then
+      node.recompute stabilization
+    else
+      pure false
+  let infoAfterRecompute ← node.infoRef.get
+  let missingValueAfterRecompute := !(← node.hasValue)
+  node.infoRef.set {
+    infoAfterRecompute with
+    stale := false,
+    computedAt :=
+      if missingValueAfterRecompute then infoAfterRecompute.computedAt else some stabilization,
+    changedAt := if changed then some stabilization else infoAfterRecompute.changedAt,
+    visitingAt := none
+  }
+  pure changed
+
+/-- Drain the recompute heap using barrier-per-height parallel execution.
+    Each height level is processed as a batch:
+    - Nodes with `kind.isParallelSafe` run concurrently via `IO.asTask`.
+    - `bind`, `freeze`, and `expert` nodes run sequentially (they call `setChildren`
+      or contain arbitrary `IO`).
+    - After the `IO.Task.get` barrier, shared-state post-processing runs sequentially.
+
+    The outer while-loop re-reads the minimum occupied height on every iteration so
+    that bind-induced lower-height entries (added by `setChildren` → `retainNecessary`)
+    are picked up before the bind node's parents. -/
+partial def State.drainRecomputeHeapParallel (state : State) (stabilization : Nat) : IO Unit := do
+  let size ← state.recomputeHeap.sizeRef.get
+  if size == 0 then return
+  let minH ← State.findMinOccupiedFrom state (← state.recomputeHeap.nextHeight.get)
+  match minH with
+  | none => return
+  | some h =>
+      -- Pop the entire height-h bucket.
+      let rawBatch ← State.popBucketAtHeight state h
+      -- Partition: filter to necessary stale/missing; refresh heights;
+      -- re-enqueue height-changed entries; split into parallel and sequential.
+      let mut parallelBatch : Array Nat := #[]
+      let mut sequentialBatch : Array Nat := #[]
+      for id in rawBatch do
+        let node ← State.getNode state id
+        let info ← node.infoRef.get
+        let missingValue := !(← node.hasValue)
+        if info.necessary && (info.stale || missingValue) then
+          let newH ← State.refreshHeightFromChildren state id
+          if newH != h then
+            -- Height changed (bind rewired children); re-enqueue at new height.
+            State.enqueueRecompute state id
+          else if info.kind.isParallelSafe then
+            parallelBatch := parallelBatch.push id
+          else
+            sequentialBatch := sequentialBatch.push id
+      -- Phase 1: Parallel execution for parallel-safe nodes.
+      -- Tasks only write their own infoRef/valueRef — no shared-state writes.
+      let parallelResults : Array Bool ←
+        if parallelBatch.isEmpty then
+          pure #[]
+        else if parallelBatch.size == 1 then
+          -- Single node: avoid task-spawn overhead.
+          let changed ← State.stabilizeOneParallelSafe state stabilization parallelBatch[0]!
+          pure #[changed]
+        else
+          let tasks : Array (Task (Except IO.Error Bool)) ←
+            parallelBatch.mapM (fun id =>
+              (IO.asTask (State.stabilizeOneParallelSafe state stabilization id) : IO _))
+          -- Barrier: await every task before propagating any error.
+          -- If we used mapM directly, a throw in task k would skip Task.get on
+          -- tasks k+1..n, leaving them running after the write lock is released.
+          let allResults : Array (Except IO.Error Bool) := tasks.map (fun t => Task.get t)
+          allResults.mapM IO.ofExcept
+      -- Phase 2: Sequential execution for bind/freeze/expert.
+      -- stabilizeOne handles its own shared-state updates.
+      for id in sequentialBatch do
+        State.stabilizeOne state stabilization id
+      -- Phase 3: Sequential post-processing for the parallel batch.
+      -- All shared-state updates that were deferred from Phase 1.
+      state.nodesVisitedRef.modify (· + parallelBatch.size)
+      for i in [:parallelBatch.size] do
+        let id := parallelBatch[i]!
+        let changed := parallelResults[i]!
+        State.removeStaleNecessaryId state id
+        State.appendTraceEvent state id (some stabilization) (.recomputed changed)
+        if changed then
+          state.changedNodeIdsRef.modify (fun ids => ids.push id)
+          State.markParentsStale state id
+      -- Recurse: picks up parents enqueued by markParentsStale (heights > h)
+      -- and any bind-induced lower-height entries from Phase 2.
+      State.drainRecomputeHeapParallel state stabilization
 
 def State.applyDeferredMutations (state : State) (currentEpoch : Nat) : IO Unit := do
   let ops <- state.deferredMutationsRef.get

@@ -12,6 +12,7 @@ import Leancremental.Core.Expert
 import Leancremental.Core.Observer
 import Leancremental.Core.Invariant
 import Leancremental.Core.Snapshot
+import Leancremental.Core.Federation
 
 /-!
 Leancremental's executable incremental runtime.

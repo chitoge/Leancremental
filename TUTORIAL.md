@@ -29,6 +29,9 @@ If you want a slower introduction to those terms, read
 
 If you want short task-oriented examples first, read [COOKBOOK.md](COOKBOOK.md).
 
+Parallel stabilization and federation are advanced topics. You do not need them
+for the core runtime model in this tutorial.
+
 The rest of this tutorial assumes one key operational rule:
 
 - `Var.set` changes an input
@@ -202,7 +205,7 @@ operation. The preferred path is to choose a cutoff when constructing
 `const`, `ret`, `Var.create`, or `map` through `map5`; `Incr.setCutoff` remains
 available when you need to reconfigure a node later.
 
-For a beginner, the easiest way to think about a cutoff is:
+One useful way to think about a cutoff is:
 
 - "did this recomputation produce a meaningfully new value?"
 
@@ -229,6 +232,8 @@ As a rule of thumb:
 - Use `Cutoff.ofHash` to combine a cheap hash precheck with equality confirmation.
 - Use `Cutoff.ofHashUnchecked` only when hash collisions are an acceptable approximation.
 - Use structural cutoffs like `Cutoff.ofEq` or `Cutoff.ofDecidableEq` for small exact data.
+
+**The default propagates on every recompute.** `Cutoff.never` — the default on every combinator — means the node always reports a change to its parents, even when the output value is identical to the previous value. In a wide graph, a single `Var.set` can cascade through many derived nodes that produce the same result as before. If you see unnecessary recomputes, add a cutoff at the node that is stable.
 
 ## Dynamic Graphs With Bind
 
@@ -338,6 +343,10 @@ When `length` changes, the bind node rewires the dependencies to the selected
 prefix. This is the same conceptual role that `bind` plays in OCaml
 Incremental's dynamic examples.
 
+Advanced note: every rewire of `bind` creates a new child subgraph. In long-running programs that rewire often, call [`State.reclaimUnreachableNodes`](https://chitoge.github.io/Leancremental/Leancremental/Core/State.html#Leancremental.State.reclaimUnreachableNodes) periodically after stabilization to clean up unreachable nodes.
+
+Advanced note: all nodes passed to one combinator must belong to the same `State`. Mixing states raises `IO.userError`.
+
 `dependOn` is useful when one incremental should keep another incremental alive
 without using its value.
 
@@ -431,11 +440,7 @@ def dotExample : IO String := do
 `State.formatCycle` expose cycle diagnostics, and stabilization reports cycle
 paths when it detects one.
 
-The OCaml implementation comments also identify invariants that are useful for
-proof work. Leancremental exposes the subset represented by the current runtime:
-bidirectional parent/child metadata, height ordering, necessary-node closure,
-timestamp ordering, recompute-heap sanity, and the post-stabilization fact that
-necessary nodes are not stale and have cached values.
+Leancremental also exposes invariant checks for runtime debugging. These are mainly useful when validating the graph implementation or investigating a bug.
 
 ```lean
 def invariantExample : IO Unit := do
@@ -447,10 +452,7 @@ def invariantExample : IO Unit := do
   State.checkStableInvariants state
 ```
 
-OCaml's bind-scope invariant is stronger than what Leancremental can currently
-state: it relies on explicit scopes and an adjust-heights heap. That is the next
-place to enrich the proof model if we want proofs about dynamic graphs to match
-OCaml Incremental more closely.
+
 
 ## Tracking Impact of Changes
 
@@ -615,9 +617,7 @@ def pureExample : Nat :=
   Pure.eval expr
 ```
 
-This model is not a replacement for the executable graph engine. It is a proof
-surface for equations such as map composition, fold evaluation, and snapshot
-soundness.
+This model is not a replacement for the executable graph engine. It is for proof-oriented work on stable snapshots and expression-level reasoning.
 
 `Leancremental.Core` also imports a small bridge module. The strongest current
 bridge is spec-first: write a `Pure.Expr`, prove facts about that expression, and
@@ -632,10 +632,7 @@ def compiledPureExample : IO Nat := do
   Observer.value! observer
 ```
 
-That makes the proof describe the code by construction: the expression being
-simplified by Lean is also the recipe used to allocate the runtime graph. For
-hand-written `IO` graphs, the next proof layer should add explicit refinement
-lemmas saying which `Pure.Expr` each graph implements.
+This lets one pure expression serve both as a specification and as the recipe used to allocate the runtime graph.
 
 Once an executable value has been observed and read from `IO`,
 `CoreSnapshot.stableValueSnapshot` reflects that stable value into the pure
