@@ -2,7 +2,7 @@ import Lake
 open Lake DSL
 
 package leancremental where
-  version := v!"0.1.0"
+  version := v!"0.4.0"
   keywords := #["incremental", "self-adjusting-computation", "reactive"]
 
 @[default_target]
