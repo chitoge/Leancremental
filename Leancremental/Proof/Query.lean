@@ -152,10 +152,10 @@ theorem aggregateErase_not_contains [BEq κ]
     aggregateContainsKey (aggregateErase entries key) key = false := by
   rw [aggregateContainsKey_eq_false]
   intro index inBounds
-  have kept : ((aggregateErase entries key)[index].1 != key) := by
-    simpa [aggregateErase] using
-      (Array.getElem_filter (xs := entries) (p := fun entry : κ × Incr α => entry.1 != key) inBounds)
-  simpa [bne] using kept
+  have kept : ((aggregateErase entries key)[index].1 != key) = true := by
+    simp only [aggregateErase]
+    exact Array.getElem_filter inBounds
+  simp_all [bne]
 
 /-- Erasing aggregate entries cannot grow the entry array. -/
 theorem aggregateErase_size_le [BEq κ]
